@@ -19,10 +19,14 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <mutex>
 #include <utility>
 #include <fstream>
 
@@ -54,8 +58,38 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
 
+struct server_moe_router_sample {
+    int layer;
+    llama_token token_id;
+    std::vector<int32_t> experts;
+};
+
 struct server_moe_router_state {
     std::vector<llama_token> tokens;
+
+    mutable std::mutex mutex;
+    mutable std::condition_variable cv;
+    mutable std::deque<server_moe_router_sample> samples;
+    size_t max_samples = 10000;
+
+    void push_sample(server_moe_router_sample sample) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (samples.size() >= max_samples) {
+            samples.pop_front();
+        }
+        samples.push_back(std::move(sample));
+        cv.notify_one();
+    }
+
+    bool pop_sample(server_moe_router_sample & sample, std::chrono::milliseconds timeout) const {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!cv.wait_for(lock, timeout, [this] { return !samples.empty(); })) {
+            return false;
+        }
+        sample = std::move(samples.front());
+        samples.pop_front();
+        return true;
+    }
 };
 
 static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -65,7 +99,7 @@ static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_d
         return strncmp(t->name, "ffn_moe_topk", 12) == 0;
     }
 
-    if (t->type != GGML_TYPE_I32) {
+    if (t->type != GGML_TYPE_I32 || state == nullptr) {
         return true;
     }
 
@@ -76,6 +110,9 @@ static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_d
         return true;
     }
 
+    int layer = -1;
+    sscanf(t->name, "ffn_moe_topk-%d", &layer);
+
     const size_t n_bytes = ggml_nbytes(t);
     std::vector<uint8_t> data(n_bytes);
     ggml_backend_tensor_get(t, data.data(), 0, n_bytes);
@@ -83,7 +120,17 @@ static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_d
     const int32_t * experts = reinterpret_cast<const int32_t *>(data.data());
 
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
-        const llama_token token_id = (state && tok < (int64_t) state->tokens.size()) ? state->tokens[tok] : -1;
+        const llama_token token_id = (tok < (int64_t) state->tokens.size()) ? state->tokens[tok] : -1;
+
+        server_moe_router_sample sample;
+        sample.layer = layer;
+        sample.token_id = token_id;
+        sample.experts.reserve(n_expert_used);
+        for (int64_t k = 0; k < n_expert_used; ++k) {
+            sample.experts.push_back(experts[tok * n_expert_used + k]);
+        }
+        state->push_sample(std::move(sample));
+
         printf("[moe-router] %s token %2" PRId64 " (id %6d):", t->name, tok, token_id);
         for (int64_t k = 0; k < n_expert_used; ++k) {
             printf(" %d", experts[tok * n_expert_used + k]);
@@ -911,6 +958,8 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
+    server_moe_router_state moe_router_state;
+
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
@@ -960,8 +1009,6 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
-
-    server_moe_router_state moe_router_state;
 
     server_metrics metrics;
 
@@ -5119,6 +5166,46 @@ void server_routes::init_routes() {
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
         res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_moe_routed_experts = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        res->content_type = "text/event-stream";
+        res->headers["Cache-Control"] = "no-cache";
+
+        auto & state = ctx_server.moe_router_state;
+
+        res->next = [&state, &should_stop = req.should_stop](std::string & chunk) -> bool {
+            chunk.clear();
+
+            std::vector<server_moe_router_sample> batch;
+            batch.reserve(128);
+
+            server_moe_router_sample sample;
+            if (state.pop_sample(sample, std::chrono::milliseconds(100))) {
+                batch.push_back(std::move(sample));
+                while (batch.size() < 128 && state.pop_sample(sample, std::chrono::milliseconds(0))) {
+                    batch.push_back(std::move(sample));
+                }
+            } else {
+                if (should_stop()) {
+                    return false;
+                }
+                return true;
+            }
+
+            for (const auto & s : batch) {
+                json j;
+                j["layer"] = s.layer;
+                j["token_id"] = s.token_id;
+                j["experts"] = s.experts;
+                chunk += "data: " + j.dump() + "\n\n";
+            }
+
+            return true;
+        };
+
         return res;
     };
 }
