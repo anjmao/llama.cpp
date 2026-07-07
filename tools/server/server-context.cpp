@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -51,6 +52,46 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
 
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+}
+
+struct server_moe_router_state {
+    std::vector<llama_token> tokens;
+};
+
+static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * state = static_cast<server_moe_router_state *>(user_data);
+
+    if (ask) {
+        return strncmp(t->name, "ffn_moe_topk", 12) == 0;
+    }
+
+    if (t->type != GGML_TYPE_I32) {
+        return true;
+    }
+
+    const int64_t n_expert_used = t->ne[0];
+    const int64_t n_tokens      = t->ne[1];
+
+    if (n_tokens <= 0 || n_expert_used <= 0) {
+        return true;
+    }
+
+    const size_t n_bytes = ggml_nbytes(t);
+    std::vector<uint8_t> data(n_bytes);
+    ggml_backend_tensor_get(t, data.data(), 0, n_bytes);
+
+    const int32_t * experts = reinterpret_cast<const int32_t *>(data.data());
+
+    for (int64_t tok = 0; tok < n_tokens; ++tok) {
+        const llama_token token_id = (state && tok < (int64_t) state->tokens.size()) ? state->tokens[tok] : -1;
+        printf("[moe-router] %s token %2" PRId64 " (id %6d):", t->name, tok, token_id);
+        for (int64_t k = 0; k < n_expert_used; ++k) {
+            printf(" %d", experts[tok * n_expert_used + k]);
+        }
+        printf("\n");
+    }
+
+    return true;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -920,6 +961,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    server_moe_router_state moe_router_state;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();
@@ -1154,6 +1197,12 @@ private:
         {
             params_base.load_progress_callback = load_progress_callback;
             params_base.load_progress_callback_user_data = &load_progress_text;
+        }
+
+        // log MoE router expert selections per token
+        {
+            params_base.cb_eval = server_moe_router_cb;
+            params_base.cb_eval_user_data = &moe_router_state;
         }
 
         llama_init = common_init_from_params(params_base);
@@ -2770,7 +2819,7 @@ private:
             }
 
             if (all_idle) {
-                SRV_INF("%s", "all slots are idle\n");
+                SRV_INF("%s", "all slots are idle 🍆\n");
                 return; // skip further processing
 
             } else {
@@ -3594,6 +3643,11 @@ private:
             return true; // nothing to decode
         } else {
             n_empty_consecutive = 0;
+        }
+
+        // capture tokens in the current decode view for MoE router logging
+        {
+            moe_router_state.tokens.assign(batch_view.token, batch_view.token + batch_view.n_tokens);
         }
 
         const int ret = llama_decode(ctx_tgt, batch_view);

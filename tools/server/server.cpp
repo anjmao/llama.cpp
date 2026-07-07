@@ -372,7 +372,7 @@ int llama_server(int argc, char ** argv) {
 #endif
 
     if (is_router_server) {
-        SRV_INF("router server is listening on %s\n", ctx_http.listening_address.c_str());
+        SRV_INF("router server 🍆 is listening on %s\n", ctx_http.listening_address.c_str());
         SRV_WRN("%s", "NOTE: router mode is experimental\n");
         SRV_WRN("%s", "      it is not recommended to use this mode in untrusted environments\n");
 
