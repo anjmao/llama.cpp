@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MoE Router Visualizer</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <style>
     .expert-grid {
       display: grid;
@@ -53,28 +54,34 @@
     }
     .backend-gpu { background: #dbeafe; color: #1e40af; }
     .backend-cpu { background: #fee2e2; color: #991b1b; }
+    [x-cloak] { display: none !important; }
   </style>
 </head>
 <body class="bg-gray-50 text-gray-900 min-h-screen">
-  <div class="max-w-[1600px] mx-auto p-4">
+  <div x-data="moeApp()" x-init="init()" class="max-w-[1600px] mx-auto p-4">
     <header class="mb-4 flex flex-wrap items-center justify-between gap-3">
       <div>
         <h1 class="text-2xl font-bold">MoE Router Visualizer</h1>
         <p class="text-sm text-gray-500">Stream from <code class="bg-gray-200 px-1 rounded">/v1/moe/routed-experts</code></p>
       </div>
       <div class="flex items-center gap-3">
-        <div id="status" class="text-sm font-medium px-3 py-1 rounded-full bg-gray-200 text-gray-700">Disconnected</div>
-        <button id="clearBtn" class="px-4 py-2 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-md text-sm font-medium">Clear</button>
+        <div
+          id="status"
+          class="text-sm font-medium px-3 py-1 rounded-full"
+          :class="statusClass"
+          x-text="statusText"
+        ></div>
+        <button id="clearBtn" @click="clear" class="px-4 py-2 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-md text-sm font-medium">Clear</button>
       </div>
       <div class="w-full flex flex-wrap items-center gap-3 text-sm">
         <label for="sessionId" class="font-medium">Session ID:</label>
-        <input id="sessionId" type="text" class="px-2 py-1 border border-gray-300 rounded-md font-mono text-xs w-64" placeholder="auto-generated">
-        <button id="newSessionBtn" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">New session</button>
-        <button id="copySessionBtn" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">Copy</button>
-        <button id="saveSessionBtn" class="px-3 py-1 bg-green-100 hover:bg-green-200 text-green-900 rounded text-xs font-medium">Save Session</button>
-        <button id="historyBtn" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">History</button>
+        <input id="sessionId" type="text" x-model="sessionId" @keydown.enter="updateSession" class="px-2 py-1 border border-gray-300 rounded-md font-mono text-xs w-64" placeholder="auto-generated">
+        <button id="newSessionBtn" @click="newSession" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">New session</button>
+        <button id="copySessionBtn" @click="copySession" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">Copy</button>
+        <button id="saveSessionBtn" @click="openSaveModal" class="px-3 py-1 bg-green-100 hover:bg-green-200 text-green-900 rounded text-xs font-medium">Save Session</button>
+        <button id="historyBtn" @click="openHistoryPanel" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">History</button>
       </div>
-      <div id="connectionHint" class="w-full text-xs text-gray-500 hidden">
+      <div id="connectionHint" class="w-full text-xs text-gray-500" x-show="showConnectionHint">
         The browser keeps the SSE request open while waiting for the llama-server to process a chat completion. Use the Session ID below in your request to correlate events.
       </div>
     </header>
@@ -83,31 +90,31 @@
       <h2 class="text-lg font-semibold mb-2">Chat</h2>
       <div class="text-xs text-gray-500 mb-2">Send a prompt to the backend using the current Session ID</div>
       <div class="flex flex-col gap-3">
-        <textarea id="chatInput" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Type a prompt..."></textarea>
+        <textarea id="chatInput" x-model="chatInput" @keydown.enter="if (!$event.shiftKey) { $event.preventDefault(); sendChat(); }" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Type a prompt..."></textarea>
         <div class="flex items-center gap-3">
-          <button id="chatSendBtn" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm font-medium">Send</button>
-          <span id="chatStatus" class="text-sm text-gray-500"></span>
+          <button id="chatSendBtn" @click="sendChat" :disabled="chatStreaming" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm font-medium disabled:opacity-50">Send</button>
+          <span id="chatStatus" class="text-sm text-gray-500" x-text="chatStatusText"></span>
         </div>
       </div>
-      <div id="chatResponse" class="mt-3 max-h-64 overflow-y-auto text-sm whitespace-pre-wrap border border-gray-200 rounded-md p-3 bg-gray-50 hidden"></div>
+      <div id="chatResponse" x-ref="chatResponse" x-show="showChatResponse" x-text="chatResponse" class="mt-3 max-h-64 overflow-y-auto text-sm whitespace-pre-wrap border border-gray-200 rounded-md p-3 bg-gray-50"></div>
     </div>
 
     <div class="bg-white rounded-lg shadow p-4 mb-4">
       <div class="flex flex-wrap items-center justify-between gap-4 mb-3">
         <div class="text-sm">
-          <span class="font-semibold">Tokens:</span> <span id="tokenCount">0</span>
+          <span class="font-semibold">Tokens:</span> <span id="tokenCount" x-text="tokens.length"></span>
           <span class="mx-2 text-gray-300">|</span>
-          <span class="font-semibold">Events:</span> <span id="eventCount">0</span>
+          <span class="font-semibold">Events:</span> <span id="eventCount" x-text="events.length"></span>
           <span class="mx-2 text-gray-300">|</span>
-          <span class="font-semibold">Max layer:</span> <span id="maxLayer">-</span>
+          <span class="font-semibold">Max layer:</span> <span id="maxLayer" x-text="maxLayer >= 0 ? maxLayer : '-'"></span>
           <span class="mx-2 text-gray-300">|</span>
-          <span class="font-semibold">Max expert:</span> <span id="maxExpert">-</span>
+          <span class="font-semibold">Max expert:</span> <span id="maxExpert" x-text="maxExpert >= 0 ? maxExpert : '-'"></span>
         </div>
         <div class="flex items-center gap-3">
-          <button id="playBtn" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium disabled:opacity-50">Play</button>
+          <button id="playBtn" @click="togglePlay" :disabled="tokens.length === 0" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium disabled:opacity-50" x-text="playing ? 'Pause' : 'Play'"></button>
           <label class="text-sm font-medium">Token:</label>
-          <input id="tokenSlider" type="range" min="0" max="0" value="0" class="w-64 accent-blue-600" disabled>
-          <span id="currentToken" class="text-sm font-mono w-40 text-right">-</span>
+          <input id="tokenSlider" type="range" x-model.number="currentTokenIndex" :min="0" :max="Math.max(0, tokens.length - 1)" :disabled="tokens.length === 0" class="w-64 accent-blue-600">
+          <span id="currentToken" class="text-sm font-mono w-40 text-right" x-text="currentTokenLabel"></span>
         </div>
       </div>
     </div>
@@ -119,7 +126,34 @@
           <div class="text-xs text-gray-500">Experts selected up to current token</div>
         </div>
         <div id="currentGrid" class="overflow-x-auto">
-          <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+          <template x-if="maxLayer < 0 || maxExpert < 0">
+            <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+          </template>
+          <template x-if="maxLayer >= 0 && maxExpert >= 0">
+            <div class="expert-grid" :style="{ gridTemplateColumns: '48px repeat(' + expertsArr.length + ', minmax(18px, 1fr))' }">
+              <div class="layer-label">Layer</div>
+              <template x-for="ex in expertsArr" :key="'h-' + ex">
+                <div class="expert-header" x-text="ex"></div>
+              </template>
+              <template x-for="layer in layersArr" :key="'r-' + layer">
+                <div class="contents">
+                  <div class="layer-label">
+                    <span x-text="'L' + layer"></span>
+                    <span class="backend-badge" :class="backendBadgeClass(layer)" x-text="backendBadgeText(layer)"></span>
+                  </div>
+                  <template x-for="ex in expertsArr" :key="'c-' + layer + '-' + ex">
+                    <div
+                      class="expert-cell"
+                      :class="currentCellClass(layer, ex)"
+                      :style="currentCellStyle(layer, ex)"
+                      :title="cellTitle(layer, ex, currentCellCount(layer, ex))"
+                      x-text="ex"
+                    ></div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
         </div>
       </div>
 
@@ -129,7 +163,34 @@
           <div class="text-xs text-gray-500">Total selections across whole prompt</div>
         </div>
         <div id="cumulativeGrid" class="overflow-x-auto">
-          <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+          <template x-if="maxLayer < 0 || maxExpert < 0">
+            <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+          </template>
+          <template x-if="maxLayer >= 0 && maxExpert >= 0">
+            <div class="expert-grid" :style="{ gridTemplateColumns: '48px repeat(' + expertsArr.length + ', minmax(18px, 1fr))' }">
+              <div class="layer-label">Layer</div>
+              <template x-for="ex in expertsArr" :key="'h-' + ex">
+                <div class="expert-header" x-text="ex"></div>
+              </template>
+              <template x-for="layer in layersArr" :key="'r-' + layer">
+                <div class="contents">
+                  <div class="layer-label">
+                    <span x-text="'L' + layer"></span>
+                    <span class="backend-badge" :class="backendBadgeClass(layer)" x-text="backendBadgeText(layer)"></span>
+                  </div>
+                  <template x-for="ex in expertsArr" :key="'c-' + layer + '-' + ex">
+                    <div
+                      class="expert-cell"
+                      :class="cumulativeCellClass(layer, ex)"
+                      :style="cumulativeCellStyle(layer, ex)"
+                      :title="cellTitle(layer, ex, cumulativeCellCount(layer, ex))"
+                      x-text="ex"
+                    ></div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
         </div>
       </div>
     </div>
@@ -137,660 +198,575 @@
     <div class="mt-4 bg-white rounded-lg shadow p-4">
       <h2 class="text-lg font-semibold mb-2">Backend residency</h2>
       <div class="text-xs text-gray-500 mb-2">Per-layer tensor placement reported by the server</div>
-      <div id="backendLegend" class="flex flex-wrap gap-2"></div>
+      <div id="backendLegend" x-html="backendLegendHTML"></div>
     </div>
-  </div>
 
-  <div id="saveModal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
+    <div id="saveModal" class="fixed inset-0 bg-black bg-opacity-50 items-center justify-center z-50 flex" x-show="showSaveModal" x-cloak @keydown.escape.window="closeSaveModal">
     <div class="bg-white rounded-lg shadow-lg p-6 w-full max-w-md">
       <h3 class="text-lg font-semibold mb-3">Save Session</h3>
       <label class="block text-sm font-medium text-gray-700 mb-1">Name</label>
-      <input id="saveSessionName" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm mb-4" placeholder="e.g. prompt about bash one-liner">
+      <input id="saveSessionName" x-model="saveSessionName" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm mb-4" placeholder="e.g. prompt about bash one-liner">
       <div class="flex justify-end gap-2">
-        <button id="cancelSaveBtn" class="px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-md text-sm">Cancel</button>
-        <button id="confirmSaveBtn" class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-md text-sm">Save</button>
+        <button id="cancelSaveBtn" @click="closeSaveModal" class="px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-md text-sm">Cancel</button>
+        <button id="confirmSaveBtn" @click="confirmSaveSession" :disabled="saveSessionName.trim() === '' || saving" class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-md text-sm disabled:opacity-50" x-text="saving ? 'Saving...' : 'Save'"></button>
       </div>
     </div>
   </div>
 
-  <div id="historyPanel" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
+  <div id="historyPanel" class="fixed inset-0 bg-black bg-opacity-50 items-center justify-center z-50 flex" x-show="showHistoryPanel" x-cloak @keydown.escape.window="closeHistoryPanel">
     <div class="bg-white rounded-lg shadow-lg p-6 w-full max-w-2xl max-h-[80vh] flex flex-col">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Saved Sessions</h3>
-        <button id="closeHistoryBtn" class="text-gray-500 hover:text-gray-700 text-xl">&times;</button>
+        <button id="closeHistoryBtn" @click="closeHistoryPanel" class="text-gray-500 hover:text-gray-700 text-xl">&times;</button>
       </div>
       <div id="historyList" class="overflow-y-auto flex-1">
-        <div class="text-sm text-gray-400 italic p-4 text-center">No saved sessions</div>
+        <template x-if="sessions.length === 0">
+          <div class="text-sm text-gray-400 italic p-4 text-center">No saved sessions</div>
+        </template>
+        <template x-if="sessions.length > 0">
+          <div class="flex flex-col gap-2">
+            <template x-for="s in sessions" :key="s.id">
+              <div class="flex items-center justify-between p-3 border border-gray-200 rounded-md hover:bg-gray-50">
+                <div class="flex flex-col">
+                  <span class="font-medium text-sm" x-text="s.name"></span>
+                  <span class="text-xs text-gray-500" x-text="s.session_id + ' · ' + new Date(s.created_at).toLocaleString() + ' · ' + s.event_count + ' events'"></span>
+                </div>
+                <button class="load-session-btn px-3 py-1 bg-blue-100 hover:bg-blue-200 text-blue-900 rounded text-xs font-medium" @click="loadSavedSession(s.id)">Load</button>
+              </div>
+            </template>
+          </div>
+        </template>
       </div>
     </div>
   </div>
 
   <script>
-    const state = {
-      connected: false,
-      source: null,
-      events: [],
-      tokens: [],
-      tokenSet: new Set(),
-      tokenText: {},
-      tokenPosition: {},
-      maxLayer: -1,
-      maxExpert: -1,
-      currentTokenIndex: 0,
-      playing: false,
-      playInterval: null,
-      backendByLayer: {},
-      renderScheduled: false,
-      sessionId: getSessionIdFromURL() || generateSessionId(),
-      chatStreaming: false
-    };
+    function moeApp() {
+      return {
+        connected: false,
+        source: null,
+        events: [],
+        tokens: [],
+        tokenSet: {},
+        tokenText: {},
+        tokenPosition: {},
+        maxLayer: -1,
+        maxExpert: -1,
+        currentTokenIndex: 0,
+        playing: false,
+        playInterval: null,
+        backendByLayer: {},
+        renderScheduled: false,
+        sessionId: '',
+        chatStreaming: false,
+        chatInput: '',
+        chatResponse: '',
+        chatStatusText: '',
+        showChatResponse: false,
+        saveSessionName: '',
+        saving: false,
+        showSaveModal: false,
+        showHistoryPanel: false,
+        sessions: [],
+        statusText: 'Disconnected',
+        showConnectionHint: false,
+        expertsArr: [],
+        layersArr: [],
+        cumulativeCounts: {},
+        cumulativeMaxCount: 1,
+        currentCounts: {},
+        currentMaxCount: 1,
+        currentSelected: {},
+        backendLegendHTML: '',
 
-    const els = {
-      status: document.getElementById('status'),
-      connectionHint: document.getElementById('connectionHint'),
-      sessionIdInput: document.getElementById('sessionId'),
-      newSessionBtn: document.getElementById('newSessionBtn'),
-      copySessionBtn: document.getElementById('copySessionBtn'),
-      saveSessionBtn: document.getElementById('saveSessionBtn'),
-      historyBtn: document.getElementById('historyBtn'),
-      clearBtn: document.getElementById('clearBtn'),
-      saveModal: document.getElementById('saveModal'),
-      saveSessionName: document.getElementById('saveSessionName'),
-      confirmSaveBtn: document.getElementById('confirmSaveBtn'),
-      cancelSaveBtn: document.getElementById('cancelSaveBtn'),
-      historyPanel: document.getElementById('historyPanel'),
-      historyList: document.getElementById('historyList'),
-      closeHistoryBtn: document.getElementById('closeHistoryBtn'),
-      playBtn: document.getElementById('playBtn'),
-      tokenSlider: document.getElementById('tokenSlider'),
-      currentToken: document.getElementById('currentToken'),
-      tokenCount: document.getElementById('tokenCount'),
-      eventCount: document.getElementById('eventCount'),
-      maxLayer: document.getElementById('maxLayer'),
-      maxExpert: document.getElementById('maxExpert'),
-      currentGrid: document.getElementById('currentGrid'),
-      cumulativeGrid: document.getElementById('cumulativeGrid'),
-      backendLegend: document.getElementById('backendLegend'),
-      chatInput: document.getElementById('chatInput'),
-      chatSendBtn: document.getElementById('chatSendBtn'),
-      chatStatus: document.getElementById('chatStatus'),
-      chatResponse: document.getElementById('chatResponse')
-    };
+        get statusClass() {
+          if (this.statusText === 'Receiving events') return 'bg-green-100 text-green-800';
+          if (this.statusText === 'Connected, waiting for events...') return 'bg-blue-100 text-blue-800';
+          if (this.statusText === 'Connecting...') return 'bg-yellow-100 text-yellow-800';
+          if (this.statusText === 'Error / Reconnecting...') return 'bg-red-100 text-red-800';
+          if (this.statusText.startsWith('Loaded:')) return 'bg-purple-100 text-purple-800';
+          return 'bg-gray-200 text-gray-700';
+        },
 
-    function generateSessionId() {
-      return 'sess-' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
-    }
+        get currentTokenLabel() {
+          const currentTokenId = this.tokens[this.currentTokenIndex];
+          if (currentTokenId === undefined) return '-';
+          const text = this.tokenText[currentTokenId] || '';
+          return text ? `${currentTokenId} (${text})` : String(currentTokenId);
+        },
 
-    function getSessionIdFromURL() {
-      const params = new URLSearchParams(window.location.search);
-      return params.get('session_id') || '';
-    }
+        init() {
+          this.sessionId = this.getSessionIdFromURL() || this.generateSessionId();
+          this.updateURLSessionId(this.sessionId);
+          this.$watch('currentTokenIndex', () => this.updateComputed());
+          this.connect();
+          this.scheduleRender();
+        },
 
-    function updateURLSessionId(sessionId) {
-      const url = new URL(window.location.href);
-      if (sessionId) {
-        url.searchParams.set('session_id', sessionId);
-      } else {
-        url.searchParams.delete('session_id');
-      }
-      window.history.replaceState({}, '', url);
-    }
+        generateSessionId() {
+          return 'sess-' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+        },
 
-    function connect() {
-      if (state.source) return;
+        getSessionIdFromURL() {
+          const params = new URLSearchParams(window.location.search);
+          return params.get('session_id') || '';
+        },
 
-      const sessionId = els.sessionIdInput.value.trim();
-      const url = sessionId
-        ? '/v1/moe/routed-experts?session_id=' + encodeURIComponent(sessionId)
-        : '/v1/moe/routed-experts';
-
-      els.status.textContent = 'Connecting...';
-      els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-yellow-100 text-yellow-800';
-
-      const source = new EventSource(url);
-      state.source = source;
-
-      source.onopen = () => {
-        console.log('EventSource open')
-        state.connected = true;
-        if (state.events.length === 0) {
-          els.status.textContent = 'Connected, waiting for events...';
-          els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-blue-100 text-blue-800';
-          els.connectionHint.classList.remove('hidden');
-        } else {
-          els.status.textContent = 'Receiving events';
-          els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-green-100 text-green-800';
-        }
-      };
-
-      source.onmessage = (e) => {
-        if (!e.data || e.data.trim() === '') return;
-        try {
-          const data = JSON.parse(e.data);
-          handleEvent(data);
-          els.status.textContent = 'Receiving events';
-          els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-green-100 text-green-800';
-          els.connectionHint.classList.add('hidden');
-        } catch (err) {
-          console.warn('failed to parse event', e.data, err);
-        }
-      };
-
-      source.onerror = () => {
-        disconnect();
-        els.status.textContent = 'Error / Reconnecting...';
-        els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-red-100 text-red-800';
-      };
-    }
-
-    function disconnect() {
-      if (state.source) {
-        state.source.close();
-        state.source = null;
-      }
-      state.connected = false;
-      els.status.textContent = 'Disconnected';
-      els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-gray-200 text-gray-700';
-    }
-
-    function handleEvent(data) {
-      console.log(data)
-      state.events.push(data);
-
-      if (!state.tokenSet.has(data.token_id)) {
-        state.tokenSet.add(data.token_id);
-        state.tokenPosition[data.token_id] = state.tokens.length;
-        state.tokens.push(data.token_id);
-      }
-      if (data.token) {
-        state.tokenText[data.token_id] = data.token;
-      }
-
-      state.maxLayer = Math.max(state.maxLayer, data.layer);
-      data.experts.forEach(e => {
-        state.maxExpert = Math.max(state.maxExpert, e);
-      });
-
-      if (data.backend) {
-        state.backendByLayer[data.layer] = data.backend;
-      }
-
-      scheduleRender();
-    }
-
-    function updateSlider() {
-      const max = Math.max(0, state.tokens.length - 1);
-      els.tokenSlider.max = max;
-      els.tokenSlider.disabled = state.tokens.length === 0;
-      els.playBtn.disabled = state.tokens.length === 0;
-
-      if (state.currentTokenIndex > max) {
-        state.currentTokenIndex = max;
-      }
-      els.tokenSlider.value = state.currentTokenIndex;
-    }
-
-    function scheduleRender() {
-      if (state.renderScheduled) return;
-      state.renderScheduled = true;
-      requestAnimationFrame(() => {
-        state.renderScheduled = false;
-        updateSlider();
-        render();
-      });
-    }
-
-    function render() {
-      els.tokenCount.textContent = state.tokens.length;
-      els.eventCount.textContent = state.events.length;
-      els.maxLayer.textContent = state.maxLayer >= 0 ? state.maxLayer : '-';
-      els.maxExpert.textContent = state.maxExpert >= 0 ? state.maxExpert : '-';
-
-      const currentTokenId = state.tokens[state.currentTokenIndex];
-      const currentTokenStr = currentTokenId !== undefined ? String(currentTokenId) : '-';
-      const currentText = currentTokenId !== undefined ? (state.tokenText[currentTokenId] || '') : '';
-      els.currentToken.textContent = currentText ? `${currentTokenStr} (${currentText})` : currentTokenStr;
-
-      const currentPosition = state.tokenPosition[currentTokenId];
-      const currentEvents = state.tokens.length > 0 && currentPosition !== undefined
-        ? state.events.filter(e => state.tokenPosition[e.token_id] <= currentPosition)
-        : [];
-
-      renderGrid(els.currentGrid, currentEvents, true, currentTokenId);
-      renderGrid(els.cumulativeGrid, state.events, false, currentTokenId);
-      renderBackendLegend();
-    }
-
-    function renderGrid(container, events, isCurrent, currentTokenId) {
-      if (state.maxLayer < 0 || state.maxExpert < 0) {
-        container.innerHTML = '<div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>';
-        return;
-      }
-
-      const layers = [];
-      for (let i = 0; i <= state.maxLayer; i++) layers.push(i);
-      const experts = [];
-      for (let i = 0; i <= state.maxExpert; i++) experts.push(i);
-
-      const counts = new Map();
-      events.forEach(e => {
-        e.experts.forEach(ex => {
-          const key = `${e.layer}:${ex}`;
-          counts.set(key, (counts.get(key) || 0) + 1);
-        });
-      });
-
-      const currentSelectedByLayer = new Map();
-      if (isCurrent && currentTokenId !== undefined) {
-        events.forEach(e => {
-          if (e.token_id === currentTokenId) {
-            let selected = currentSelectedByLayer.get(e.layer);
-            if (!selected) {
-              selected = new Set();
-              currentSelectedByLayer.set(e.layer, selected);
-            }
-            e.experts.forEach(ex => selected.add(ex));
-          }
-        });
-      }
-
-      const maxCount = Math.max(1, ...counts.values());
-
-      const root = document.createElement('div');
-      root.className = 'expert-grid';
-      root.style.gridTemplateColumns = `48px repeat(${experts.length}, minmax(18px, 1fr))`;
-
-      const headerRow = document.createElement('div');
-      headerRow.className = 'layer-label';
-      headerRow.textContent = 'Layer';
-      root.appendChild(headerRow);
-
-      experts.forEach(ex => {
-        const th = document.createElement('div');
-        th.className = 'expert-header';
-        th.textContent = ex;
-        root.appendChild(th);
-      });
-
-      layers.forEach(layer => {
-        const backend = state.backendByLayer[layer];
-        const badgeClass = backend && backend.ffn_down_exps === 'gpu' ? 'backend-gpu' : 'backend-cpu';
-        const badgeText = backend && backend.ffn_down_exps === 'gpu' ? 'gpu' : 'cpu';
-
-        const label = document.createElement('div');
-        label.className = 'layer-label';
-        label.innerHTML = `<span>L${layer}</span><span class="backend-badge ${badgeClass}">${badgeText}</span>`;
-        root.appendChild(label);
-
-        experts.forEach(ex => {
-          const key = `${layer}:${ex}`;
-          const count = counts.get(key) || 0;
-          const cell = document.createElement('div');
-          cell.className = 'expert-cell';
-          cell.title = `layer ${layer}, expert ${ex}${count ? ', count: ' + count : ''}`;
-          cell.textContent = ex;
-
-          if (count > 0) {
-            const intensity = Math.min(1, count / maxCount);
-            const hue = 217;
-            const sat = 90;
-            const light = 95 - intensity * 45;
-            cell.style.backgroundColor = `hsl(${hue}, ${sat}%, ${light}%)`;
-            cell.classList.add('selected');
+        updateURLSessionId(sessionId) {
+          const url = new URL(window.location.href);
+          if (sessionId) {
+            url.searchParams.set('session_id', sessionId);
           } else {
-            cell.classList.add('bg-gray-100');
+            url.searchParams.delete('session_id');
           }
+          window.history.replaceState({}, '', url);
+        },
 
-          if (isCurrent) {
-            const selected = currentSelectedByLayer.get(layer);
-            if (selected && selected.has(ex)) {
-              cell.classList.add('current');
+        connect() {
+          if (this.source) return;
+
+          const sessionId = this.sessionId.trim();
+          const url = sessionId
+            ? '/v1/moe/routed-experts?session_id=' + encodeURIComponent(sessionId)
+            : '/v1/moe/routed-experts';
+
+          this.statusText = 'Connecting...';
+          this.showConnectionHint = false;
+
+          const source = new EventSource(url);
+          this.source = source;
+
+          source.onopen = () => {
+            this.connected = true;
+            if (this.events.length === 0) {
+              this.statusText = 'Connected, waiting for events...';
+              this.showConnectionHint = true;
+            } else {
+              this.statusText = 'Receiving events';
+              this.showConnectionHint = false;
             }
-          }
+          };
 
-          root.appendChild(cell);
-        });
-      });
-
-      container.innerHTML = '';
-      container.appendChild(root);
-    }
-
-    function renderBackendLegend() {
-      if (Object.keys(state.backendByLayer).length === 0) {
-        els.backendLegend.innerHTML = '<span class="text-sm text-gray-400">No backend data yet</span>';
-        return;
-      }
-
-      const keys = ['ffn_down_exps', 'ffn_gate_up_exps', 'ffn_up_exps', 'ffn_gate_exps'];
-      const labels = {
-        ffn_down_exps: 'down',
-        ffn_gate_up_exps: 'gate_up',
-        ffn_up_exps: 'up',
-        ffn_gate_exps: 'gate'
-      };
-
-      const legend = document.createElement('div');
-      legend.className = 'flex flex-col gap-2';
-
-      const header = document.createElement('div');
-      header.className = 'grid gap-1 text-xs font-semibold text-gray-600';
-      header.style.gridTemplateColumns = '60px repeat(4, 60px)';
-      header.innerHTML = '<span>Layer</span>' + keys.map(k => `<span>${labels[k]}</span>`).join('');
-      legend.appendChild(header);
-
-      Object.keys(state.backendByLayer)
-        .map(Number)
-        .sort((a, b) => a - b)
-        .forEach(layer => {
-          const row = document.createElement('div');
-          row.className = 'grid gap-1 text-xs';
-          row.style.gridTemplateColumns = '60px repeat(4, 60px)';
-
-          let html = `<span class="font-medium">L${layer}</span>`;
-          keys.forEach(k => {
-            const val = state.backendByLayer[layer][k] || 'cpu';
-            const cls = val === 'gpu' ? 'backend-gpu' : 'backend-cpu';
-            html += `<span class="backend-badge ${cls}">${val}</span>`;
-          });
-          row.innerHTML = html;
-          legend.appendChild(row);
-        });
-
-      els.backendLegend.innerHTML = '';
-      els.backendLegend.appendChild(legend);
-    }
-
-    function clear() {
-      state.events = [];
-      state.tokens = [];
-      state.tokenSet.clear();
-      state.maxLayer = -1;
-      state.maxExpert = -1;
-      state.currentTokenIndex = 0;
-      state.backendByLayer = {};
-      stopPlay();
-      updateSlider();
-      scheduleRender();
-    }
-
-    function stopPlay() {
-      state.playing = false;
-      els.playBtn.textContent = 'Play';
-      if (state.playInterval) {
-        clearInterval(state.playInterval);
-        state.playInterval = null;
-      }
-    }
-
-    function togglePlay() {
-      if (state.playing) {
-        stopPlay();
-        return;
-      }
-      if (state.tokens.length === 0) return;
-      state.playing = true;
-      els.playBtn.textContent = 'Pause';
-      state.playInterval = setInterval(() => {
-        if (state.currentTokenIndex >= state.tokens.length - 1) {
-          state.currentTokenIndex = 0;
-        } else {
-          state.currentTokenIndex++;
-        }
-        els.tokenSlider.value = state.currentTokenIndex;
-        render();
-      }, 200);
-    }
-
-    els.clearBtn.addEventListener('click', clear);
-
-    function openSaveModal() {
-      els.saveSessionName.value = '';
-      els.saveModal.classList.remove('hidden');
-      els.saveModal.classList.add('flex');
-      els.saveSessionName.focus();
-    }
-
-    function closeSaveModal() {
-      els.saveModal.classList.add('hidden');
-      els.saveModal.classList.remove('flex');
-    }
-
-    async function confirmSaveSession() {
-      const name = els.saveSessionName.value.trim();
-      if (!name) return;
-
-      els.confirmSaveBtn.disabled = true;
-      els.confirmSaveBtn.textContent = 'Saving...';
-
-      try {
-        const response = await fetch('/v1/moe/save-session', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name,
-            session_id: state.sessionId,
-            events: state.events
-          })
-        });
-
-        if (!response.ok) {
-          throw new Error('Save failed: ' + await response.text());
-        }
-
-        closeSaveModal();
-      } catch (err) {
-        alert(err.message);
-      } finally {
-        els.confirmSaveBtn.disabled = false;
-        els.confirmSaveBtn.textContent = 'Save';
-      }
-    }
-
-    function openHistoryPanel() {
-      els.historyPanel.classList.remove('hidden');
-      els.historyPanel.classList.add('flex');
-      loadHistory();
-    }
-
-    function closeHistoryPanel() {
-      els.historyPanel.classList.add('hidden');
-      els.historyPanel.classList.remove('flex');
-    }
-
-    async function loadHistory() {
-      try {
-        const response = await fetch('/v1/moe/sessions');
-        if (!response.ok) throw new Error('Failed to load history');
-        const sessions = await response.json();
-        renderHistoryList(sessions);
-      } catch (err) {
-        els.historyList.innerHTML = '<div class="text-sm text-red-500 p-4 text-center">' + err.message + '</div>';
-      }
-    }
-
-    function renderHistoryList(sessions) {
-      if (!sessions || sessions.length === 0) {
-        els.historyList.innerHTML = '<div class="text-sm text-gray-400 italic p-4 text-center">No saved sessions</div>';
-        return;
-      }
-
-      const root = document.createElement('div');
-      root.className = 'flex flex-col gap-2';
-
-      sessions.forEach(s => {
-        const row = document.createElement('div');
-        row.className = 'flex items-center justify-between p-3 border border-gray-200 rounded-md hover:bg-gray-50';
-        row.innerHTML = `
-          <div class="flex flex-col">
-            <span class="font-medium text-sm">${escapeHtml(s.name)}</span>
-            <span class="text-xs text-gray-500">${escapeHtml(s.session_id)} · ${new Date(s.created_at).toLocaleString()} · ${s.event_count} events</span>
-          </div>
-          <button class="load-session-btn px-3 py-1 bg-blue-100 hover:bg-blue-200 text-blue-900 rounded text-xs font-medium" data-id="${s.id}">Load</button>
-        `;
-        root.appendChild(row);
-      });
-
-      root.addEventListener('click', (e) => {
-        if (e.target.classList.contains('load-session-btn')) {
-          const id = e.target.getAttribute('data-id');
-          loadSavedSession(id);
-        }
-      });
-
-      els.historyList.innerHTML = '';
-      els.historyList.appendChild(root);
-    }
-
-    function escapeHtml(text) {
-      const div = document.createElement('div');
-      div.textContent = text;
-      return div.innerHTML;
-    }
-
-    async function loadSavedSession(id) {
-      try {
-        const response = await fetch('/v1/moe/sessions/' + id);
-        if (!response.ok) throw new Error('Failed to load session');
-        const data = await response.json();
-
-        disconnect();
-        clear();
-        state.sessionId = data.session_id;
-        els.sessionIdInput.value = data.session_id;
-
-        data.events.forEach(ev => handleEvent(ev));
-
-        els.status.textContent = 'Loaded: ' + data.name;
-        els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-purple-100 text-purple-800';
-        closeHistoryPanel();
-      } catch (err) {
-        alert(err.message);
-      }
-    }
-
-    els.saveSessionBtn.addEventListener('click', openSaveModal);
-    els.cancelSaveBtn.addEventListener('click', closeSaveModal);
-    els.confirmSaveBtn.addEventListener('click', confirmSaveSession);
-    els.historyBtn.addEventListener('click', openHistoryPanel);
-    els.closeHistoryBtn.addEventListener('click', closeHistoryPanel);
-
-    async function sendChat() {
-      const prompt = els.chatInput.value.trim();
-      if (!prompt || state.chatStreaming) return;
-
-      state.chatStreaming = true;
-      els.chatSendBtn.disabled = true;
-      els.chatStatus.textContent = 'Sending...';
-      els.chatResponse.classList.remove('hidden');
-      els.chatResponse.textContent = '';
-
-      const sessionId = els.sessionIdInput.value.trim();
-      const body = JSON.stringify({
-        messages: [{ role: 'user', content: prompt }],
-        stream: true,
-        session_id: sessionId
-      });
-
-      try {
-        const response = await fetch('/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body
-        });
-
-        if (!response.ok) {
-          const text = await response.text();
-          throw new Error(`HTTP ${response.status}: ${text}`);
-        }
-
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let content = '';
-
-        els.chatStatus.textContent = 'Streaming...';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop();
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed.startsWith('data:')) continue;
-            const data = trimmed.slice(5).trim();
-            if (data === '[DONE]') continue;
-
+          source.onmessage = (e) => {
+            if (!e.data || e.data.trim() === '') return;
             try {
-              const chunk = JSON.parse(data);
-              const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
-              if (delta && delta.content) {
-                content += delta.content;
-                els.chatResponse.textContent = content;
-                els.chatResponse.scrollTop = els.chatResponse.scrollHeight;
-              }
-            } catch (e) {
-              // ignore malformed chunks
+              const data = JSON.parse(e.data);
+              this.handleEvent(data);
+              this.statusText = 'Receiving events';
+              this.showConnectionHint = false;
+            } catch (err) {
+              console.warn('failed to parse event', e.data, err);
             }
+          };
+
+          source.onerror = () => {
+            this.disconnect();
+            this.statusText = 'Error / Reconnecting...';
+          };
+        },
+
+        disconnect() {
+          if (this.source) {
+            this.source.close();
+            this.source = null;
           }
+          this.connected = false;
+          this.statusText = 'Disconnected';
+          this.showConnectionHint = false;
+        },
+
+        handleEvent(data) {
+          this.events.push(data);
+
+          if (!this.tokenSet[data.token_id]) {
+            this.tokenSet[data.token_id] = true;
+            this.tokenPosition[data.token_id] = this.tokens.length;
+            this.tokens.push(data.token_id);
+          }
+          if (data.token) {
+            this.tokenText[data.token_id] = data.token;
+          }
+
+          this.maxLayer = Math.max(this.maxLayer, data.layer);
+          data.experts.forEach(e => {
+            this.maxExpert = Math.max(this.maxExpert, e);
+          });
+
+          if (data.backend) {
+            this.backendByLayer[data.layer] = data.backend;
+          }
+
+          this.scheduleRender();
+        },
+
+        updateSlider() {
+          const max = Math.max(0, this.tokens.length - 1);
+          if (this.currentTokenIndex > max) {
+            this.currentTokenIndex = max;
+          }
+        },
+
+        scheduleRender() {
+          if (this.renderScheduled) return;
+          this.renderScheduled = true;
+          requestAnimationFrame(() => {
+            this.renderScheduled = false;
+            this.updateSlider();
+            this.updateComputed();
+          });
+        },
+
+        updateComputed() {
+          this.expertsArr = [];
+          for (let i = 0; i <= this.maxExpert; i++) this.expertsArr.push(i);
+          this.layersArr = [];
+          for (let i = 0; i <= this.maxLayer; i++) this.layersArr.push(i);
+
+          this.cumulativeCounts = {};
+          this.events.forEach(e => {
+            e.experts.forEach(ex => {
+              const key = `${e.layer}:${ex}`;
+              this.cumulativeCounts[key] = (this.cumulativeCounts[key] || 0) + 1;
+            });
+          });
+          this.cumulativeMaxCount = Math.max(1, ...Object.values(this.cumulativeCounts));
+
+          const currentTokenId = this.tokens[this.currentTokenIndex];
+          const currentPosition = this.tokenPosition[currentTokenId];
+          this.currentCounts = {};
+          this.currentSelected = {};
+          if (currentPosition !== undefined) {
+            this.events.forEach(e => {
+              if (this.tokenPosition[e.token_id] <= currentPosition) {
+                e.experts.forEach(ex => {
+                  const key = `${e.layer}:${ex}`;
+                  this.currentCounts[key] = (this.currentCounts[key] || 0) + 1;
+                });
+              }
+              if (e.token_id === currentTokenId) {
+                if (!this.currentSelected[e.layer]) this.currentSelected[e.layer] = {};
+                e.experts.forEach(ex => {
+                  this.currentSelected[e.layer][ex] = true;
+                });
+              }
+            });
+          }
+          this.currentMaxCount = Math.max(1, ...Object.values(this.currentCounts));
+
+          this.backendLegendHTML = this.buildBackendLegendHTML();
+        },
+
+        cumulativeCellCount(layer, ex) {
+          return this.cumulativeCounts[`${layer}:${ex}`] || 0;
+        },
+
+        currentCellCount(layer, ex) {
+          return this.currentCounts[`${layer}:${ex}`] || 0;
+        },
+
+        cumulativeCellClass(layer, ex) {
+          return this.cumulativeCellCount(layer, ex) > 0 ? 'selected' : 'bg-gray-100';
+        },
+
+        currentCellClass(layer, ex) {
+          const count = this.currentCellCount(layer, ex);
+          const classes = [];
+          if (count > 0) classes.push('selected');
+          else classes.push('bg-gray-100');
+          if (this.currentSelected[layer] && this.currentSelected[layer][ex]) {
+            classes.push('current');
+          }
+          return classes.join(' ');
+        },
+
+        cellStyleForCount(count, maxCount) {
+          if (count === 0) return {};
+          const intensity = Math.min(1, count / maxCount);
+          const hue = 217;
+          const sat = 90;
+          const light = 95 - intensity * 45;
+          return { backgroundColor: `hsl(${hue}, ${sat}%, ${light}%)` };
+        },
+
+        cumulativeCellStyle(layer, ex) {
+          return this.cellStyleForCount(this.cumulativeCellCount(layer, ex), this.cumulativeMaxCount);
+        },
+
+        currentCellStyle(layer, ex) {
+          return this.cellStyleForCount(this.currentCellCount(layer, ex), this.currentMaxCount);
+        },
+
+        cellTitle(layer, ex, count) {
+          return `layer ${layer}, expert ${ex}${count ? ', count: ' + count : ''}`;
+        },
+
+        backendBadgeClass(layer) {
+          const backend = this.backendByLayer[layer];
+          return backend && backend.ffn_down_exps === 'gpu' ? 'backend-gpu' : 'backend-cpu';
+        },
+
+        backendBadgeText(layer) {
+          const backend = this.backendByLayer[layer];
+          return backend && backend.ffn_down_exps === 'gpu' ? 'gpu' : 'cpu';
+        },
+
+        buildBackendLegendHTML() {
+          if (Object.keys(this.backendByLayer).length === 0) {
+            return '<span class="text-sm text-gray-400">No backend data yet</span>';
+          }
+
+          const keys = ['ffn_down_exps', 'ffn_gate_up_exps', 'ffn_up_exps', 'ffn_gate_exps'];
+          const labels = {
+            ffn_down_exps: 'down',
+            ffn_gate_up_exps: 'gate_up',
+            ffn_up_exps: 'up',
+            ffn_gate_exps: 'gate'
+          };
+
+          let html = '<div class="flex flex-col gap-2">';
+          html += '<div class="grid gap-1 text-xs font-semibold text-gray-600" style="grid-template-columns: 60px repeat(4, 60px);">';
+          html += '<span>Layer</span>';
+          keys.forEach(k => {
+            html += `<span>${labels[k]}</span>`;
+          });
+          html += '</div>';
+
+          Object.keys(this.backendByLayer)
+            .map(Number)
+            .sort((a, b) => a - b)
+            .forEach(layer => {
+              html += '<div class="grid gap-1 text-xs" style="grid-template-columns: 60px repeat(4, 60px);">';
+              html += `<span class="font-medium">L${layer}</span>`;
+              keys.forEach(k => {
+                const val = this.backendByLayer[layer][k] || 'cpu';
+                const cls = val === 'gpu' ? 'backend-gpu' : 'backend-cpu';
+                html += `<span class="backend-badge ${cls}">${val}</span>`;
+              });
+              html += '</div>';
+            });
+
+          html += '</div>';
+          return html;
+        },
+
+        clear() {
+          this.events = [];
+          this.tokens = [];
+          this.tokenSet = {};
+          this.maxLayer = -1;
+          this.maxExpert = -1;
+          this.currentTokenIndex = 0;
+          this.backendByLayer = {};
+          this.stopPlay();
+          this.scheduleRender();
+        },
+
+        stopPlay() {
+          this.playing = false;
+          if (this.playInterval) {
+            clearInterval(this.playInterval);
+            this.playInterval = null;
+          }
+        },
+
+        togglePlay() {
+          if (this.playing) {
+            this.stopPlay();
+            return;
+          }
+          if (this.tokens.length === 0) return;
+          this.playing = true;
+          this.playInterval = setInterval(() => {
+            if (this.currentTokenIndex >= this.tokens.length - 1) {
+              this.currentTokenIndex = 0;
+            } else {
+              this.currentTokenIndex++;
+            }
+            this.updateComputed();
+          }, 200);
+        },
+
+        openSaveModal() {
+          this.saveSessionName = '';
+          this.showHistoryPanel = false;
+          this.showSaveModal = true;
+          this.$nextTick(() => {
+            const el = document.getElementById('saveSessionName');
+            if (el) el.focus();
+          });
+        },
+
+        closeSaveModal() {
+          this.showSaveModal = false;
+        },
+
+        async confirmSaveSession() {
+          const name = this.saveSessionName.trim();
+          if (!name) return;
+
+          this.saving = true;
+          try {
+            const response = await fetch('/v1/moe/save-session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                name: name,
+                session_id: this.sessionId,
+                events: this.events
+              })
+            });
+
+            if (!response.ok) {
+              throw new Error('Save failed: ' + await response.text());
+            }
+
+            this.closeSaveModal();
+          } catch (err) {
+            alert(err.message);
+          } finally {
+            this.saving = false;
+          }
+        },
+
+        openHistoryPanel() {
+          this.showSaveModal = false;
+          this.showHistoryPanel = true;
+          this.loadHistory();
+        },
+
+        closeHistoryPanel() {
+          this.showHistoryPanel = false;
+        },
+
+        async loadHistory() {
+          try {
+            const response = await fetch('/v1/moe/sessions');
+            if (!response.ok) throw new Error('Failed to load history');
+            this.sessions = await response.json();
+          } catch (err) {
+            this.sessions = [];
+          }
+        },
+
+        escapeHtml(text) {
+          const div = document.createElement('div');
+          div.textContent = text;
+          return div.innerHTML;
+        },
+
+        async loadSavedSession(id) {
+          try {
+            const response = await fetch('/v1/moe/sessions/' + id);
+            if (!response.ok) throw new Error('Failed to load session');
+            const data = await response.json();
+
+            this.disconnect();
+            this.clear();
+            this.sessionId = data.session_id;
+
+            data.events.forEach(ev => this.handleEvent(ev));
+
+            this.statusText = 'Loaded: ' + data.name;
+            this.closeHistoryPanel();
+          } catch (err) {
+            alert(err.message);
+          }
+        },
+
+        async sendChat() {
+          const prompt = this.chatInput.trim();
+          if (!prompt || this.chatStreaming) return;
+
+          this.chatStreaming = true;
+          this.chatStatusText = 'Sending...';
+          this.chatResponse = '';
+          this.showChatResponse = true;
+
+          const body = JSON.stringify({
+            messages: [{ role: 'user', content: prompt }],
+            stream: true,
+            session_id: this.sessionId.trim()
+          });
+
+          try {
+            const response = await fetch('/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body
+            });
+
+            if (!response.ok) {
+              const text = await response.text();
+              throw new Error(`HTTP ${response.status}: ${text}`);
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let content = '';
+
+            this.chatStatusText = 'Streaming...';
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop();
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('data:')) continue;
+                const data = trimmed.slice(5).trim();
+                if (data === '[DONE]') continue;
+
+                try {
+                  const chunk = JSON.parse(data);
+                  const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+                  if (delta && delta.content) {
+                    content += delta.content;
+                    this.chatResponse = content;
+                    this.$nextTick(() => {
+                      const el = this.$refs.chatResponse;
+                      if (el) el.scrollTop = el.scrollHeight;
+                    });
+                  }
+                } catch (e) {
+                  // ignore malformed chunks
+                }
+              }
+            }
+
+            this.chatStatusText = 'Done';
+          } catch (err) {
+            this.chatStatusText = 'Error';
+            this.chatResponse = 'Error: ' + err.message;
+            console.error(err);
+          } finally {
+            this.chatStreaming = false;
+          }
+        },
+
+        newSession() {
+          this.sessionId = this.generateSessionId();
+          this.updateURLSessionId(this.sessionId);
+          this.disconnect();
+          this.connect();
+        },
+
+        updateSession() {
+          this.sessionId = this.sessionId.trim();
+          this.updateURLSessionId(this.sessionId);
+          this.disconnect();
+          this.connect();
+        },
+
+        copySession() {
+          navigator.clipboard.writeText(this.sessionId).catch(() => {});
         }
-
-        els.chatStatus.textContent = 'Done';
-      } catch (err) {
-        els.chatStatus.textContent = 'Error';
-        els.chatResponse.textContent = 'Error: ' + err.message;
-        console.error(err);
-      } finally {
-        state.chatStreaming = false;
-        els.chatSendBtn.disabled = false;
-      }
+      };
     }
-
-    els.chatSendBtn.addEventListener('click', sendChat);
-    els.chatInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        sendChat();
-      }
-    });
-
-    els.newSessionBtn.addEventListener('click', () => {
-      state.sessionId = generateSessionId();
-      els.sessionIdInput.value = state.sessionId;
-      updateURLSessionId(state.sessionId);
-      disconnect();
-      connect();
-    });
-
-    els.sessionIdInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        state.sessionId = els.sessionIdInput.value.trim();
-        updateURLSessionId(state.sessionId);
-        disconnect();
-        connect();
-      }
-    });
-
-    els.copySessionBtn.addEventListener('click', () => {
-      navigator.clipboard.writeText(els.sessionIdInput.value).catch(() => {});
-    });
-
-    els.sessionIdInput.value = state.sessionId;
-    updateURLSessionId(state.sessionId);
-    connect();
-
-    els.tokenSlider.addEventListener('input', (e) => {
-      state.currentTokenIndex = parseInt(e.target.value, 10);
-      scheduleRender();
-    });
-
-    els.playBtn.addEventListener('click', togglePlay);
-
-    scheduleRender();
   </script>
 </body>
 </html>
