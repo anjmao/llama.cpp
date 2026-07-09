@@ -38,6 +38,7 @@ func main() {
 		w.Write(indexHTML)
 	})
 	mux.HandleFunc("/v1/moe/routed-experts", handleProxy)
+	mux.HandleFunc("/v1/chat/completions", handleProxy)
 
 	server := &http.Server{
 		Addr:              *listenAddr,
@@ -49,7 +50,7 @@ func main() {
 	}
 
 	log.Printf("ui server listening on %s", *listenAddr)
-	log.Printf("proxying /v1/moe/routed-experts to %s", *backendURL)
+	log.Printf("proxying /v1/* to %s", *backendURL)
 	log.Fatal(server.ListenAndServe())
 }
 
