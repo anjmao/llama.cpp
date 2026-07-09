@@ -135,7 +135,8 @@
       currentTokenIndex: 0,
       playing: false,
       playInterval: null,
-      backendByLayer: {}
+      backendByLayer: {},
+      renderScheduled: false
     };
 
     const els = {
@@ -225,8 +226,7 @@
         state.backendByLayer[data.layer] = data.backend;
       }
 
-      updateSlider();
-      render();
+      scheduleRender();
     }
 
     function updateSlider() {
@@ -239,6 +239,16 @@
         state.currentTokenIndex = max;
       }
       els.tokenSlider.value = state.currentTokenIndex;
+    }
+
+    function scheduleRender() {
+      if (state.renderScheduled) return;
+      state.renderScheduled = true;
+      requestAnimationFrame(() => {
+        state.renderScheduled = false;
+        updateSlider();
+        render();
+      });
     }
 
     function render() {
@@ -446,12 +456,12 @@
 
     els.tokenSlider.addEventListener('input', (e) => {
       state.currentTokenIndex = parseInt(e.target.value, 10);
-      render();
+      scheduleRender();
     });
 
     els.playBtn.addEventListener('click', togglePlay);
 
-    render();
+    scheduleRender();
   </script>
 </body>
 </html>

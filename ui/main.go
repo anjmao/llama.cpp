@@ -1,14 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"embed"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"time"
-	"fmt"
 )
 
 //go:embed index.html
@@ -65,6 +66,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Printf("Proxy to %s\n", target)
+	defer func() {
+		fmt.Printf("Proxy to %s closed\n", target)
+	}()
 
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
 	if err != nil {
@@ -88,9 +92,35 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	for k, vv := range resp.Header {
 		for _, v := range vv {
+			// let the backend set the content type; avoid length since we stream
+			if k == "Content-Length" {
+				continue
+			}
 			w.Header().Add(k, v)
 		}
 	}
+	// ensure the response is treated as a streaming SSE response
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		io.Copy(w, resp.Body)
+		return
+	}
+
+	// stream line-by-line so SSE chunks are forwarded immediately
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 4096), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		fmt.Printf("Line received %s\n", string(line))
+		if _, err := w.Write(append(line, '\n')); err != nil {
+			return
+		}
+		flusher.Flush()
+	}
 }
