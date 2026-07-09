@@ -60,6 +60,7 @@ static uint32_t server_n_outputs_max(const common_params & params) {
 }
 
 struct server_moe_router_sample {
+    std::string cmpl_id;
     int layer;
     llama_token token_id;
     std::vector<int32_t> experts;
@@ -69,22 +70,65 @@ struct server_moe_router_sample {
     bool gate_exps_host   = false;
 };
 
+struct server_moe_router_cmpl_aggregation {
+    int n_experts = 0;
+    std::map<int, std::map<int, int>> counts; // layer -> expert -> count
+    std::map<int, json> backends;             // layer -> backend residency
+    int total_samples = 0;
+};
+
 struct server_moe_router_state {
     const llama_model * model = nullptr;
     std::vector<llama_token> tokens;
+    std::vector<std::string> cmpl_ids; // parallel to tokens
 
     mutable std::mutex mutex;
     mutable std::condition_variable cv;
     mutable std::deque<server_moe_router_sample> samples;
     size_t max_samples = 10000;
 
+    // per-completion aggregations
+    mutable std::mutex cmpl_mutex;
+    mutable std::unordered_map<std::string, server_moe_router_cmpl_aggregation> cmpl_aggs;
+    size_t max_cmpl_completions = 1000;
+
     void push_sample(server_moe_router_sample sample) const {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (samples.size() >= max_samples) {
-            samples.pop_front();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (samples.size() >= max_samples) {
+                samples.pop_front();
+            }
+            samples.push_back(sample);
+            cv.notify_one();
         }
-        samples.push_back(std::move(sample));
-        cv.notify_one();
+
+        if (!sample.cmpl_id.empty()) {
+            std::lock_guard<std::mutex> lock(cmpl_mutex);
+            if (cmpl_aggs.size() >= max_cmpl_completions &&
+                cmpl_aggs.find(sample.cmpl_id) == cmpl_aggs.end()) {
+                // drop oldest completion to make room
+                if (!cmpl_aggs.empty()) {
+                    cmpl_aggs.erase(cmpl_aggs.begin());
+                }
+            }
+            auto & agg = cmpl_aggs[sample.cmpl_id];
+            auto & layer_counts = agg.counts[sample.layer];
+            for (int expert : sample.experts) {
+                layer_counts[expert]++;
+                if (expert + 1 > agg.n_experts) {
+                    agg.n_experts = expert + 1;
+                }
+            }
+            agg.total_samples++;
+            if (agg.backends.find(sample.layer) == agg.backends.end()) {
+                json backend;
+                backend["ffn_down_exps"]    = sample.down_exps_host    ? "cpu" : "gpu";
+                backend["ffn_gate_up_exps"] = sample.gate_up_exps_host ? "cpu" : "gpu";
+                backend["ffn_up_exps"]      = sample.up_exps_host      ? "cpu" : "gpu";
+                backend["ffn_gate_exps"]    = sample.gate_exps_host    ? "cpu" : "gpu";
+                agg.backends[sample.layer] = std::move(backend);
+            }
+        }
     }
 
     bool pop_sample(server_moe_router_sample & sample, std::chrono::milliseconds timeout) const {
@@ -95,6 +139,44 @@ struct server_moe_router_state {
         sample = std::move(samples.front());
         samples.pop_front();
         return true;
+    }
+
+    json get_cmpl_aggregation(const std::string & cmpl_id) const {
+        std::lock_guard<std::mutex> lock(cmpl_mutex);
+        auto it = cmpl_aggs.find(cmpl_id);
+        if (it == cmpl_aggs.end()) {
+            return nullptr;
+        }
+        const auto & agg = it->second;
+        json layers = json::array();
+        for (const auto & layer_kv : agg.counts) {
+            int layer = layer_kv.first;
+            const auto & expert_counts = layer_kv.second;
+            std::vector<int> counts(agg.n_experts, 0);
+            for (const auto & ec : expert_counts) {
+                if (ec.first >= 0 && ec.first < (int) counts.size()) {
+                    counts[ec.first] = ec.second;
+                }
+            }
+            int layer_total = 0;
+            for (int c : counts) {
+                layer_total += c;
+            }
+            json layer_json;
+            layer_json["layer"] = layer;
+            layer_json["total"] = layer_total;
+            layer_json["counts"] = std::move(counts);
+            auto backend_it = agg.backends.find(layer);
+            if (backend_it != agg.backends.end()) {
+                layer_json["backend"] = backend_it->second;
+            }
+            layers.push_back(std::move(layer_json));
+        }
+        json res;
+        res["completion_id"] = cmpl_id;
+        res["n_experts"] = agg.n_experts;
+        res["layers"] = std::move(layers);
+        return res;
     }
 };
 
@@ -161,8 +243,10 @@ static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_d
 
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
         const llama_token token_id = (tok < (int64_t) state->tokens.size()) ? state->tokens[tok] : -1;
+        const std::string cmpl_id = (tok < (int64_t) state->cmpl_ids.size()) ? state->cmpl_ids[tok] : "";
 
         server_moe_router_sample sample;
+        sample.cmpl_id = cmpl_id;
         sample.layer = layer;
         sample.token_id = token_id;
         sample.down_exps_host    = down_host;
@@ -3738,9 +3822,20 @@ private:
             n_empty_consecutive = 0;
         }
 
-        // capture tokens in the current decode view for MoE router logging
+        // capture tokens and completion IDs in the current decode view for MoE router logging
         {
             moe_router_state.tokens.assign(batch_view.token, batch_view.token + batch_view.n_tokens);
+            moe_router_state.cmpl_ids.clear();
+            moe_router_state.cmpl_ids.reserve(batch_view.n_tokens);
+            for (int32_t i = off; i < off + batch_view.n_tokens; ++i) {
+                const auto & bt = batch.tokens[i];
+                std::string cmpl_id;
+                auto * slot = get_slot_by_id(bt.id_slot);
+                if (slot && slot->task) {
+                    cmpl_id = slot->task->params.oaicompat_cmpl_id;
+                }
+                moe_router_state.cmpl_ids.push_back(std::move(cmpl_id));
+            }
         }
 
         const int ret = llama_decode(ctx_tgt, batch_view);
@@ -5215,6 +5310,27 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_moe_routed_experts_for_completion = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+
+        const std::string cmpl_id = req.get_param("completion_id");
+        if (cmpl_id.empty()) {
+            res->status = 400;
+            res->data = safe_json_to_str({{"error", format_error_response("Missing completion_id query parameter", ERROR_TYPE_INVALID_REQUEST)}});
+            return res;
+        }
+
+        json agg = ctx_server.moe_router_state.get_cmpl_aggregation(cmpl_id);
+        if (agg.is_null()) {
+            res->status = 404;
+            res->data = safe_json_to_str({{"error", format_error_response("No routed expert data found for completion_id", ERROR_TYPE_NOT_FOUND)}});
+            return res;
+        }
+
+        res->data = safe_json_to_str(agg);
+        return res;
+    };
+
     this->get_moe_routed_experts = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         res->content_type = "text/event-stream";
@@ -5243,6 +5359,7 @@ void server_routes::init_routes() {
 
             for (const auto & s : batch) {
                 json j;
+                j["completion_id"] = s.cmpl_id;
                 j["layer"] = s.layer;
                 j["token_id"] = s.token_id;
                 j["experts"] = s.experts;

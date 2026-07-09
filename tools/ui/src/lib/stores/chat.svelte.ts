@@ -14,6 +14,7 @@
 import { SvelteMap } from 'svelte/reactivity';
 import { DatabaseService } from '$lib/services/database.service';
 import { ChatService } from '$lib/services/chat.service';
+import { MoeService } from '$lib/services/moe.service';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
 import { config } from '$lib/stores/settings.svelte';
 import { agenticStore } from '$lib/stores/agentic.svelte';
@@ -675,13 +676,16 @@ class ChatStore {
 		};
 
 		let completionIdRecorded = false;
+		let recordedCompletionId: string | undefined;
 		const recordCompletionId = (id: string): void => {
 			if (!id || completionIdRecorded) return;
 			completionIdRecorded = true;
+			recordedCompletionId = id;
 			const idx = conversationsStore.findMessageIndex(currentMessageId);
 			conversationsStore.updateMessageAtIndex(idx, { completionId: id });
 			DatabaseService.updateMessage(currentMessageId, { completionId: id }).catch(() => {
 				completionIdRecorded = false;
+				recordedCompletionId = undefined;
 			});
 		};
 
@@ -948,6 +952,19 @@ class ChatStore {
 					if (resolvedModel) uiUpdate.model = resolvedModel;
 					conversationsStore.updateMessageAtIndex(idx, uiUpdate);
 					await conversationsStore.updateCurrentNode(currentMessageId);
+					if (recordedCompletionId) {
+						MoeService.fetchRoutedExpertsForCompletion(recordedCompletionId)
+							.then((moeData) => {
+								if (!moeData) return;
+								const moeExperts = JSON.stringify(moeData);
+								conversationsStore.updateMessageAtIndex(idx, { moeExperts });
+								DatabaseService.updateMessage(currentMessageId, { moeExperts }).catch(
+									console.error
+								);
+							})
+							.catch(console.error);
+					}
+
 					cleanupStreamingState();
 					if (onComplete) await onComplete(content);
 					if (isRouterMode()) modelsStore.fetchRouterModels().catch(console.error);

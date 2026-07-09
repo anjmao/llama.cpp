@@ -546,6 +546,12 @@ export { default as ChatMessageStatistics } from './ChatMessages/ChatMessageStat
 export { default as ChatMessageStatisticsBadge } from './ChatMessages/ChatMessageStatistics/ChatMessageStatisticsBadge.svelte';
 
 /**
+ * MoE expert routing heatmap. Shows per-layer expert usage counts as a color-coded
+ * matrix for assistant messages that have aggregated routing data available.
+ */
+export { default as ChatMessageMoeExperts } from './ChatMessages/ChatMessageMoeExperts/ChatMessageMoeExperts.svelte';
+
+/**
  * MCP prompt display in user messages. Shows when user selected an MCP prompt
  * via ChatFormPickerMcpPrompts. Displays server name, prompt name, and expandable
  * content preview. Stored in message.extra as DatabaseMessageExtraMcpPrompt.

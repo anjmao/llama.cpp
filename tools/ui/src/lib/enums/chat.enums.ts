@@ -2,7 +2,8 @@ export enum ChatMessageStatsView {
 	GENERATION = 'generation',
 	READING = 'reading',
 	TOOLS = 'tools',
-	SUMMARY = 'summary'
+	SUMMARY = 'summary',
+	EXPERTS = 'experts'
 }
 
 /**

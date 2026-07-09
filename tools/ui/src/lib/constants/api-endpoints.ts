@@ -21,5 +21,9 @@ export const API_TOOLS = {
 	EXECUTE: '/tools'
 };
 
+export const API_MOE = {
+	ROUTED_EXPERTS_COMPLETION: '/v1/moe/routed-experts/completion'
+};
+
 /** CORS proxy endpoint path */
 export const CORS_PROXY_ENDPOINT = '/cors-proxy';

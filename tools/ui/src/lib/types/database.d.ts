@@ -117,6 +117,8 @@ export interface DatabaseMessage {
 	toolCalls?: string;
 	/** Chat completion id streamed by the server, used to target realtime control (e.g. end reasoning) */
 	completionId?: string;
+	/** Serialized JSON of ApiMoeRoutedExpertsCompletionResponse, populated after generation completes */
+	moeExperts?: string;
 	/** Tool call ID for tool result messages (role: 'tool') */
 	toolCallId?: string;
 	children: string[];

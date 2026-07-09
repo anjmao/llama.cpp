@@ -512,3 +512,23 @@ export interface ApiRouterModelsUnloadResponse {
 	success: boolean;
 	error?: string;
 }
+
+export interface ApiMoeExpertBackend {
+	ffn_down_exps: 'cpu' | 'gpu';
+	ffn_gate_up_exps: 'cpu' | 'gpu';
+	ffn_up_exps: 'cpu' | 'gpu';
+	ffn_gate_exps: 'cpu' | 'gpu';
+}
+
+export interface ApiMoeLayerExperts {
+	layer: number;
+	total: number;
+	counts: number[];
+	backend?: ApiMoeExpertBackend;
+}
+
+export interface ApiMoeRoutedExpertsCompletionResponse {
+	completion_id: string;
+	n_experts: number;
+	layers: ApiMoeLayerExperts[];
+}

@@ -78,6 +78,14 @@
 
 	let currentConfig = $derived(config());
 	let isRouter = $derived(isRouterMode());
+	let moeExperts = $derived.by((): ApiMoeRoutedExpertsCompletionResponse | undefined => {
+		if (!message.moeExperts) return undefined;
+		try {
+			return JSON.parse(message.moeExperts) as ApiMoeRoutedExpertsCompletionResponse;
+		} catch {
+			return undefined;
+		}
+	});
 	let showRawOutput = $state(false);
 
 	let rawOutputContent = $derived.by(() => {
@@ -352,6 +360,7 @@
 						predictedTokens={agentic ? agentic.llm.predicted_n : message.timings.predicted_n}
 						predictedMs={agentic ? agentic.llm.predicted_ms : message.timings.predicted_ms}
 						agenticTimings={agentic}
+						moeExperts={moeExperts}
 						onActiveViewChange={handleStatsViewChange}
 					/>
 				{:else if isLoading() && currentConfig.showMessageStats}
