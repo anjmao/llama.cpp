@@ -1,9 +1,19 @@
 <script lang="ts">
-	import { Clock, Gauge, WholeWord, BookOpenText, Sparkles, Wrench, Layers } from '@lucide/svelte';
-	import { ChatMessageStatisticsBadge } from '$lib/components/app';
+	import {
+		Clock,
+		Gauge,
+		WholeWord,
+		BookOpenText,
+		Sparkles,
+		Wrench,
+		Layers,
+		Network
+	} from '@lucide/svelte';
+	import { ChatMessageStatisticsBadge, ChatMessageMoeExperts } from '$lib/components/app';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { ChatMessageStatsView } from '$lib/enums';
 	import type { ChatMessageAgenticTimings } from '$lib/types/chat';
+	import type { ApiMoeRoutedExpertsCompletionResponse } from '$lib/types/api';
 	import { formatPerformanceTime } from '$lib/utils';
 	import { MS_PER_SECOND, DEFAULT_PERFORMANCE_TIME } from '$lib/constants';
 	import type { Component } from 'svelte';
@@ -17,6 +27,7 @@
 		isProcessingPrompt?: boolean;
 		initialView?: ChatMessageStatsView;
 		agenticTimings?: ChatMessageAgenticTimings;
+		moeExperts?: ApiMoeRoutedExpertsCompletionResponse;
 		onActiveViewChange?: (view: ChatMessageStatsView) => void;
 		hideSummary?: boolean;
 	}
@@ -30,6 +41,7 @@
 		isProcessingPrompt = false,
 		initialView = ChatMessageStatsView.GENERATION,
 		agenticTimings,
+		moeExperts,
 		onActiveViewChange,
 		hideSummary = false
 	}: Props = $props();
@@ -96,6 +108,10 @@
 
 	let hasAgenticStats = $derived(agenticTimings !== undefined && agenticTimings.toolCallsCount > 0);
 
+	let hasExpertsStats = $derived(
+		moeExperts !== undefined && moeExperts.layers !== undefined && moeExperts.layers.length > 0
+	);
+
 	let agenticToolsPerSecond = $derived(
 		hasAgenticStats && agenticTimings!.toolsMs > 0
 			? (agenticTimings!.toolCallsCount / agenticTimings!.toolsMs) * MS_PER_SECOND
@@ -152,7 +168,7 @@
 	</Tooltip.Root>
 {/snippet}
 
-<div class="inline-flex items-center text-xs text-muted-foreground">
+<div class="flex flex-col items-start gap-2 text-xs text-muted-foreground">
 	<div class="inline-flex items-center rounded-sm bg-muted-foreground/15 p-0.5">
 		{#if hasPromptStats || isLive}
 			{@render viewButton({
@@ -190,9 +206,18 @@
 				})}
 			{/if}
 		{/if}
+
+		{#if hasExpertsStats}
+			{@render viewButton({
+				view: ChatMessageStatsView.EXPERTS,
+				icon: Network,
+				label: 'Experts',
+				tooltipText: 'MoE expert routing heatmap'
+			})}
+		{/if}
 	</div>
 
-	<div class="flex items-center gap-1 px-2">
+	<div class="flex flex-wrap items-center gap-1 px-0">
 		{#if activeView === ChatMessageStatsView.GENERATION && hasGenerationStats}
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
@@ -256,6 +281,8 @@
 				value={formattedAgenticTotalTime}
 				tooltipLabel="Total time (LLM + tools)"
 			/>
+		{:else if activeView === ChatMessageStatsView.EXPERTS && hasExpertsStats}
+			<ChatMessageMoeExperts data={moeExperts!} />
 		{:else if hasPromptStats}
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"

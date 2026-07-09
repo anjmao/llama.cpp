@@ -331,3 +331,13 @@ export { RouterService } from './router.service';
  * @see migration.service.ts — full implementation (non-destructive)
  */
 export { MigrationService } from './migration.service';
+
+/**
+ * **MoeService** - MoE routed expert data retrieval
+ *
+ * Fetches aggregated Mixture-of-Experts routing statistics for completed
+ * chat completions from `/v1/moe/routed-experts/completion`.
+ *
+ * @see MoeService in services/moe.service.ts
+ */
+export { MoeService } from './moe.service';
