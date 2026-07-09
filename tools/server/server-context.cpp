@@ -63,6 +63,7 @@ struct server_moe_router_sample {
     std::string cmpl_id;
     int layer;
     llama_token token_id;
+    std::string token;
     std::string session_id;
     std::vector<int32_t> experts;
     bool down_exps_host   = false;
@@ -243,15 +244,34 @@ static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_d
         gate_host    = is_cpu_backend(layer_tensors.ffn_gate_exps);
     }
 
+    const llama_vocab * vocab = state->model != nullptr ? llama_model_get_vocab(state->model) : nullptr;
+
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
         const llama_token token_id = (tok < (int64_t) state->tokens.size()) ? state->tokens[tok] : -1;
         const std::string cmpl_id = (tok < (int64_t) state->cmpl_ids.size()) ? state->cmpl_ids[tok] : "";
         const std::string session_id = (tok < (int64_t) state->session_ids.size()) ? state->session_ids[tok] : "";
 
+        std::string token_text;
+        if (vocab != nullptr && token_id >= 0) {
+            const char * text = llama_vocab_get_text(vocab, token_id);
+            if (text != nullptr) {
+                token_text = text;
+                // BPE tokenizers encode a leading space as U+0120 (Ġ, UTF-8 0xC4 0xA0);
+                // normalize it to a regular space so displayed token text matches the final output.
+                const std::string bpe_space = "\xC4\xA0";
+                size_t pos = 0;
+                while ((pos = token_text.find(bpe_space, pos)) != std::string::npos) {
+                    token_text.replace(pos, bpe_space.length(), " ");
+                    pos += 1;
+                }
+            }
+        }
+
         server_moe_router_sample sample;
         sample.cmpl_id = cmpl_id;
         sample.layer = layer;
         sample.token_id = token_id;
+        sample.token = std::move(token_text);
         sample.session_id = session_id;
         sample.down_exps_host    = down_host;
         sample.gate_up_exps_host = gate_up_host;
@@ -5372,6 +5392,7 @@ void server_routes::init_routes() {
                 j["completion_id"] = s.cmpl_id;
                 j["layer"] = s.layer;
                 j["token_id"] = s.token_id;
+                j["token"] = s.token;
                 j["session_id"] = s.session_id;
                 j["experts"] = s.experts;
 

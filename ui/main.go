@@ -31,6 +31,7 @@ var db *sql.DB
 type routed_expert_event struct {
 	Layer     int      `json:"layer"`
 	TokenID   int      `json:"token_id"`
+	Token     string   `json:"token"`
 	SessionID string   `json:"session_id"`
 	Experts   []int    `json:"experts"`
 	Backend   struct {
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS routed_experts (
     session_db_id INTEGER NOT NULL,
     layer_id INTEGER NOT NULL,
     token_id INTEGER NOT NULL,
+    token_text TEXT,
     session_id TEXT NOT NULL,
     experts TEXT NOT NULL,
     backend_ffn_down_exps TEXT NOT NULL,
@@ -130,7 +132,14 @@ CREATE INDEX IF NOT EXISTS idx_routed_experts_session_db_id ON routed_experts(se
 CREATE INDEX IF NOT EXISTS idx_routed_experts_session_id ON routed_experts(session_id);
 `
 	_, err = db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// migrate existing databases created before token_text was added
+	_, _ = db.Exec(`ALTER TABLE routed_experts ADD COLUMN token_text TEXT IF NOT EXISTS`)
+
+	return nil
 }
 
 func handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -246,9 +255,9 @@ func handleSaveSession(w http.ResponseWriter, r *http.Request) {
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO routed_experts (
-			session_db_id, layer_id, token_id, session_id, experts,
+			session_db_id, layer_id, token_id, token_text, session_id, experts,
 			backend_ffn_down_exps, backend_ffn_gate_up_exps, backend_ffn_up_exps, backend_ffn_gate_exps
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -266,6 +275,7 @@ func handleSaveSession(w http.ResponseWriter, r *http.Request) {
 			sessionDBID,
 			ev.Layer,
 			ev.TokenID,
+			ev.Token,
 			ev.SessionID,
 			string(expertsJSON),
 			ev.Backend.FFNDown,
@@ -355,7 +365,7 @@ func handleGetSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-		SELECT layer_id, token_id, session_id, experts,
+		SELECT layer_id, token_id, token_text, session_id, experts,
 			backend_ffn_down_exps, backend_ffn_gate_up_exps, backend_ffn_up_exps, backend_ffn_gate_exps
 		FROM routed_experts
 		WHERE session_db_id = ?
@@ -372,7 +382,7 @@ func handleGetSession(w http.ResponseWriter, r *http.Request) {
 		var ev routed_expert_event
 		var expertsJSON string
 		if err := rows.Scan(
-			&ev.Layer, &ev.TokenID, &ev.SessionID, &expertsJSON,
+			&ev.Layer, &ev.TokenID, &ev.Token, &ev.SessionID, &expertsJSON,
 			&ev.Backend.FFNDown, &ev.Backend.FFNGateUp, &ev.Backend.FFNUp, &ev.Backend.FFNGate,
 		); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

@@ -103,15 +103,12 @@
           <span class="mx-2 text-gray-300">|</span>
           <span class="font-semibold">Max expert:</span> <span id="maxExpert">-</span>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-3">
           <button id="playBtn" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium disabled:opacity-50">Play</button>
           <label class="text-sm font-medium">Token:</label>
           <input id="tokenSlider" type="range" min="0" max="0" value="0" class="w-64 accent-blue-600" disabled>
-          <span id="currentToken" class="text-sm font-mono w-20 text-right">-</span>
+          <span id="currentToken" class="text-sm font-mono w-40 text-right">-</span>
         </div>
-      </div>
-      <div class="text-xs text-gray-500">
-        Use the slider to scrub through token history. The top grid shows selections up to the current token; the bottom grid shows cumulative selections for the whole prompt.
       </div>
     </div>
 
@@ -175,6 +172,8 @@
       events: [],
       tokens: [],
       tokenSet: new Set(),
+      tokenText: {},
+      tokenPosition: {},
       maxLayer: -1,
       maxExpert: -1,
       currentTokenIndex: 0,
@@ -182,7 +181,7 @@
       playInterval: null,
       backendByLayer: {},
       renderScheduled: false,
-      sessionId: generateSessionId(),
+      sessionId: getSessionIdFromURL() || generateSessionId(),
       chatStreaming: false
     };
 
@@ -220,6 +219,21 @@
 
     function generateSessionId() {
       return 'sess-' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+    }
+
+    function getSessionIdFromURL() {
+      const params = new URLSearchParams(window.location.search);
+      return params.get('session_id') || '';
+    }
+
+    function updateURLSessionId(sessionId) {
+      const url = new URL(window.location.href);
+      if (sessionId) {
+        url.searchParams.set('session_id', sessionId);
+      } else {
+        url.searchParams.delete('session_id');
+      }
+      window.history.replaceState({}, '', url);
     }
 
     function connect() {
@@ -280,12 +294,16 @@
     }
 
     function handleEvent(data) {
+      console.log(data)
       state.events.push(data);
 
       if (!state.tokenSet.has(data.token_id)) {
         state.tokenSet.add(data.token_id);
+        state.tokenPosition[data.token_id] = state.tokens.length;
         state.tokens.push(data.token_id);
-        state.tokens.sort((a, b) => a - b);
+      }
+      if (data.token) {
+        state.tokenText[data.token_id] = data.token;
       }
 
       state.maxLayer = Math.max(state.maxLayer, data.layer);
@@ -329,10 +347,13 @@
       els.maxExpert.textContent = state.maxExpert >= 0 ? state.maxExpert : '-';
 
       const currentTokenId = state.tokens[state.currentTokenIndex];
-      els.currentToken.textContent = currentTokenId !== undefined ? currentTokenId : '-';
+      const currentTokenStr = currentTokenId !== undefined ? String(currentTokenId) : '-';
+      const currentText = currentTokenId !== undefined ? (state.tokenText[currentTokenId] || '') : '';
+      els.currentToken.textContent = currentText ? `${currentTokenStr} (${currentText})` : currentTokenStr;
 
-      const currentEvents = state.tokens.length > 0
-        ? state.events.filter(e => e.token_id <= currentTokenId)
+      const currentPosition = state.tokenPosition[currentTokenId];
+      const currentEvents = state.tokens.length > 0 && currentPosition !== undefined
+        ? state.events.filter(e => state.tokenPosition[e.token_id] <= currentPosition)
         : [];
 
       renderGrid(els.currentGrid, currentEvents, true, currentTokenId);
@@ -740,8 +761,18 @@
     els.newSessionBtn.addEventListener('click', () => {
       state.sessionId = generateSessionId();
       els.sessionIdInput.value = state.sessionId;
+      updateURLSessionId(state.sessionId);
       disconnect();
       connect();
+    });
+
+    els.sessionIdInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        state.sessionId = els.sessionIdInput.value.trim();
+        updateURLSessionId(state.sessionId);
+        disconnect();
+        connect();
+      }
     });
 
     els.copySessionBtn.addEventListener('click', () => {
@@ -749,6 +780,7 @@
     });
 
     els.sessionIdInput.value = state.sessionId;
+    updateURLSessionId(state.sessionId);
     connect();
 
     els.tokenSlider.addEventListener('input', (e) => {

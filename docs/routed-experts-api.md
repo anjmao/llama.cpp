@@ -21,6 +21,7 @@ Each event contains a JSON object with the following fields:
 |-------------|------------------|-------------------------------------------------------------------------|
 | `layer`     | integer          | Transformer layer index that produced the routing decision.             |
 | `token_id`  | integer          | The actual tokenizer token ID that was routed through that layer.       |
+| `token`     | string           | Human-readable text of the token that was routed through that layer.    |
 | `session_id`| string           | Client-provided session identifier that produced this routing decision. |
 | `experts`   | array of integers| Selected expert indices, ordered by router score (highest score first). |
 | `backend`   | object           | Residency (`cpu` or `gpu`) of each expert weight tensor in the layer.   |
@@ -39,11 +40,11 @@ The reported value reflects the backend to which the layer was assigned at load 
 Example stream:
 
 ```text
-data: {"layer":15,"token_id":15,"session_id":"sess-abc123","experts":[52,8,58,30,60,4,16,17],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
+data: {"layer":15,"token_id":15,"token":"The","session_id":"sess-abc123","experts":[52,8,58,30,60,4,16,17],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
 
-data: {"layer":16,"token_id":15,"session_id":"sess-abc123","experts":[14,46,43,30,58,38,61,4],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
+data: {"layer":16,"token_id":15,"token":"The","session_id":"sess-abc123","experts":[14,46,43,30,58,38,61,4],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
 
-data: {"layer":17,"token_id":15,"session_id":"sess-abc123","experts":[54,3,53,56,8,23,0,42],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
+data: {"layer":17,"token_id":15,"token":"The","session_id":"sess-abc123","experts":[54,3,53,56,8,23,0,42],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
 ```
 
 For MoE models such as `allenai/OLMoE-1B-7B-0924`, the `experts` array typically contains 8 indices drawn from a pool of 64 experts.
