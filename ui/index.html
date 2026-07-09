@@ -66,8 +66,14 @@
         <div id="status" class="text-sm font-medium px-3 py-1 rounded-full bg-gray-200 text-gray-700">Disconnected</div>
         <button id="clearBtn" class="px-4 py-2 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-md text-sm font-medium">Clear</button>
       </div>
+      <div class="w-full flex flex-wrap items-center gap-3 text-sm">
+        <label for="sessionId" class="font-medium">Session ID:</label>
+        <input id="sessionId" type="text" class="px-2 py-1 border border-gray-300 rounded-md font-mono text-xs w-64" placeholder="auto-generated">
+        <button id="newSessionBtn" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">New session</button>
+        <button id="copySessionBtn" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">Copy</button>
+      </div>
       <div id="connectionHint" class="w-full text-xs text-gray-500 hidden">
-        The browser keeps the SSE request open while waiting for the llama-server to process a chat completion. Send a chat completion request to see events.
+        The browser keeps the SSE request open while waiting for the llama-server to process a chat completion. Use the Session ID below in your request to correlate events.
       </div>
     </header>
 
@@ -136,12 +142,16 @@
       playing: false,
       playInterval: null,
       backendByLayer: {},
-      renderScheduled: false
+      renderScheduled: false,
+      sessionId: generateSessionId()
     };
 
     const els = {
       status: document.getElementById('status'),
       connectionHint: document.getElementById('connectionHint'),
+      sessionIdInput: document.getElementById('sessionId'),
+      newSessionBtn: document.getElementById('newSessionBtn'),
+      copySessionBtn: document.getElementById('copySessionBtn'),
       clearBtn: document.getElementById('clearBtn'),
       playBtn: document.getElementById('playBtn'),
       tokenSlider: document.getElementById('tokenSlider'),
@@ -155,13 +165,22 @@
       backendLegend: document.getElementById('backendLegend')
     };
 
+    function generateSessionId() {
+      return 'sess-' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+    }
+
     function connect() {
       if (state.source) return;
+
+      const sessionId = els.sessionIdInput.value.trim();
+      const url = sessionId
+        ? '/v1/moe/routed-experts?session_id=' + encodeURIComponent(sessionId)
+        : '/v1/moe/routed-experts';
 
       els.status.textContent = 'Connecting...';
       els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-yellow-100 text-yellow-800';
 
-      const source = new EventSource('/v1/moe/routed-experts');
+      const source = new EventSource(url);
       state.source = source;
 
       source.onopen = () => {
@@ -419,7 +438,7 @@
       state.backendByLayer = {};
       stopPlay();
       updateSlider();
-      render();
+      scheduleRender();
     }
 
     function stopPlay() {
@@ -452,6 +471,18 @@
 
     els.clearBtn.addEventListener('click', clear);
 
+    els.newSessionBtn.addEventListener('click', () => {
+      state.sessionId = generateSessionId();
+      els.sessionIdInput.value = state.sessionId;
+      disconnect();
+      connect();
+    });
+
+    els.copySessionBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(els.sessionIdInput.value).catch(() => {});
+    });
+
+    els.sessionIdInput.value = state.sessionId;
     connect();
 
     els.tokenSlider.addEventListener('input', (e) => {

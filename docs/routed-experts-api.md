@@ -6,20 +6,24 @@ This endpoint streams MoE (Mixture of Experts) router decisions as they happen d
 
 ```text
 GET /v1/moe/routed-experts
+GET /v1/moe/routed-experts?session_id=<session-id>
 ```
 
 Returns a streaming response (`text/event-stream`) containing one Server-Sent Event (SSE) per batch of routed tokens.
+
+If `session_id` is provided, only routing decisions produced by chat completion requests that included the same `session_id` are streamed.
 
 ## What it returns
 
 Each event contains a JSON object with the following fields:
 
-| Field      | Type             | Description                                                             |
-|------------|------------------|-------------------------------------------------------------------------|
-| `layer`    | integer          | Transformer layer index that produced the routing decision.             |
-| `token_id` | integer          | The actual tokenizer token ID that was routed through that layer.       |
-| `experts`  | array of integers| Selected expert indices, ordered by router score (highest score first). |
-| `backend`  | object           | Residency (`cpu` or `gpu`) of each expert weight tensor in the layer.   |
+| Field       | Type             | Description                                                             |
+|-------------|------------------|-------------------------------------------------------------------------|
+| `layer`     | integer          | Transformer layer index that produced the routing decision.             |
+| `token_id`  | integer          | The actual tokenizer token ID that was routed through that layer.       |
+| `session_id`| string           | Client-provided session identifier that produced this routing decision. |
+| `experts`   | array of integers| Selected expert indices, ordered by router score (highest score first). |
+| `backend`   | object           | Residency (`cpu` or `gpu`) of each expert weight tensor in the layer.   |
 
 The `backend` object has one entry for each possible expert weight tensor:
 
@@ -35,11 +39,11 @@ The reported value reflects the backend to which the layer was assigned at load 
 Example stream:
 
 ```text
-data: {"layer":15,"token_id":15,"experts":[52,8,58,30,60,4,16,17],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
+data: {"layer":15,"token_id":15,"session_id":"sess-abc123","experts":[52,8,58,30,60,4,16,17],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
 
-data: {"layer":16,"token_id":15,"experts":[14,46,43,30,58,38,61,4],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
+data: {"layer":16,"token_id":15,"session_id":"sess-abc123","experts":[14,46,43,30,58,38,61,4],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
 
-data: {"layer":17,"token_id":15,"experts":[54,3,53,56,8,23,0,42],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
+data: {"layer":17,"token_id":15,"session_id":"sess-abc123","experts":[54,3,53,56,8,23,0,42],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
 ```
 
 For MoE models such as `allenai/OLMoE-1B-7B-0924`, the `experts` array typically contains 8 indices drawn from a pool of 64 experts.
@@ -82,7 +86,7 @@ When the callback observes a matching tensor, it:
 
 - Parses the layer index from the tensor name (`ffn_moe_topk-<layer>`).
 - Reads the selected expert indices from GPU/CPU memory using `ggml_backend_tensor_get()`.
-- For each token in the tensor, creates a `server_moe_router_sample` containing `layer`, `token_id`, and `experts`.
+- For each token in the tensor, creates a `server_moe_router_sample` containing `layer`, `token_id`, `session_id`, and `experts`.
 - Pushes the sample into a thread-safe queue (`moe_router_state.samples`).
 
 The queue is bounded at 10,000 samples; old samples are dropped when the queue is full and no client is reading.
@@ -117,16 +121,29 @@ This is independent of the HTTP stream and can be removed or gated later if the 
 
 ## Usage
 
-Start `llama-server` with an MoE model, then run:
+Start `llama-server` with an MoE model, then open the stream:
+
+To correlate events with a specific prompt, include a `session_id` in your chat completion request:
 
 ```bash
-curl -N [REDACTED-URL]
+curl  http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true,
+    "session_id": "sess-abc123"
+  }'
 ```
 
-While the stream is open, send a normal chat completion request. The stream will emit one or more events for every layer that routes tokens during that request.
+Then open the stream filtered to that session:
+
+```bash
+curl -N "[REDACTED-URL]"
+```
+
+The stream will emit one or more events for every layer that routes tokens during that request.
 
 ## Limitations
 
 - The callback runs synchronously inside `llama_decode()`, so very heavy per-sample work could slow down generation. The current implementation only copies small I32 tensors and pushes them to a queue.
-- Samples are global across all slots/sequences. There is no per-slot filtering yet.
 - The queue drops old samples if no client is connected, so starting the stream after a request has already generated tokens will not show historical data.

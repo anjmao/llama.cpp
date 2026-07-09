@@ -62,6 +62,7 @@ static uint32_t server_n_outputs_max(const common_params & params) {
 struct server_moe_router_sample {
     int layer;
     llama_token token_id;
+    std::string session_id;
     std::vector<int32_t> experts;
     bool down_exps_host   = false;
     bool gate_up_exps_host = false;
@@ -72,6 +73,7 @@ struct server_moe_router_sample {
 struct server_moe_router_state {
     const llama_model * model = nullptr;
     std::vector<llama_token> tokens;
+    std::vector<std::string> session_ids;
 
     mutable std::mutex mutex;
     mutable std::condition_variable cv;
@@ -161,10 +163,12 @@ static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_d
 
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
         const llama_token token_id = (tok < (int64_t) state->tokens.size()) ? state->tokens[tok] : -1;
+        const std::string session_id = (tok < (int64_t) state->session_ids.size()) ? state->session_ids[tok] : "";
 
         server_moe_router_sample sample;
         sample.layer = layer;
         sample.token_id = token_id;
+        sample.session_id = session_id;
         sample.down_exps_host    = down_host;
         sample.gate_up_exps_host = gate_up_host;
         sample.up_exps_host      = up_host;
@@ -3738,9 +3742,17 @@ private:
             n_empty_consecutive = 0;
         }
 
-        // capture tokens in the current decode view for MoE router logging
+        // capture tokens and session ids in the current decode view for MoE router logging
         {
             moe_router_state.tokens.assign(batch_view.token, batch_view.token + batch_view.n_tokens);
+            moe_router_state.session_ids.resize(batch_view.n_tokens);
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                const int32_t id_slot = batch.tokens[off + i].id_slot;
+                const server_slot * slot = get_slot_by_id(id_slot);
+                moe_router_state.session_ids[i] = (slot != nullptr && slot->task != nullptr)
+                    ? slot->task->session_id
+                    : "";
+            }
         }
 
         const int ret = llama_decode(ctx_tgt, batch_view);
@@ -4256,6 +4268,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
             task.id_slot = json_value(data, "id_slot", -1);
+            task.session_id = json_value(data, "session_id", std::string());
 
             // OAI-compat
             task.params.res_type          = res_type;
@@ -5220,21 +5233,24 @@ void server_routes::init_routes() {
         res->content_type = "text/event-stream";
         res->headers["Cache-Control"] = "no-cache";
 
+        const std::string session_id_filter = req.get_param("session_id");
+
         auto & state = ctx_server.moe_router_state;
 
-        res->next = [&state, &should_stop = req.should_stop](std::string & chunk) -> bool {
+        res->next = [&state, &should_stop = req.should_stop, session_id_filter](std::string & chunk) -> bool {
             chunk.clear();
 
             std::vector<server_moe_router_sample> batch;
             batch.reserve(128);
 
             server_moe_router_sample sample;
-            if (state.pop_sample(sample, std::chrono::milliseconds(100))) {
-                batch.push_back(std::move(sample));
-                while (batch.size() < 128 && state.pop_sample(sample, std::chrono::milliseconds(0))) {
+            while (batch.size() < 128 && state.pop_sample(sample, std::chrono::milliseconds(100))) {
+                if (session_id_filter.empty() || sample.session_id == session_id_filter) {
                     batch.push_back(std::move(sample));
                 }
-            } else {
+            }
+
+            if (batch.empty()) {
                 if (should_stop()) {
                     return false;
                 }
@@ -5245,6 +5261,7 @@ void server_routes::init_routes() {
                 json j;
                 j["layer"] = s.layer;
                 j["token_id"] = s.token_id;
+                j["session_id"] = s.session_id;
                 j["experts"] = s.experts;
 
                 json backend;
