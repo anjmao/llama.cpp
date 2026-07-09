@@ -43,9 +43,11 @@ type routed_expert_event struct {
 }
 
 type save_session_request struct {
-	Name     string                `json:"name"`
-	SessionID string               `json:"session_id"`
-	Events   []routed_expert_event `json:"events"`
+	Name         string                `json:"name"`
+	SessionID    string                `json:"session_id"`
+	LastQuestion string                `json:"last_question"`
+	LastAnswer   string                `json:"last_answer"`
+	Events       []routed_expert_event `json:"events"`
 }
 
 type session_summary struct {
@@ -111,6 +113,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     session_id TEXT NOT NULL,
+    last_question TEXT,
+    last_answer TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS routed_experts (
@@ -135,9 +139,6 @@ CREATE INDEX IF NOT EXISTS idx_routed_experts_session_id ON routed_experts(sessi
 	if err != nil {
 		return err
 	}
-
-	// migrate existing databases created before token_text was added
-	_, _ = db.Exec(`ALTER TABLE routed_experts ADD COLUMN token_text TEXT IF NOT EXISTS`)
 
 	return nil
 }
@@ -239,8 +240,8 @@ func handleSaveSession(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	res, err := tx.Exec(
-		"INSERT INTO sessions (name, session_id) VALUES (?, ?)",
-		req.Name, req.SessionID,
+		"INSERT INTO sessions (name, session_id, last_question, last_answer) VALUES (?, ?, ?, ?)",
+		req.Name, req.SessionID, req.LastQuestion, req.LastAnswer,
 	)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -355,7 +356,9 @@ func handleGetSession(w http.ResponseWriter, r *http.Request) {
 	var sessionID string
 	var name string
 	var createdAt string
-	err := db.QueryRow("SELECT session_id, name, created_at FROM sessions WHERE id = ?", idStr).Scan(&sessionID, &name, &createdAt)
+	var lastQuestion string
+	var lastAnswer string
+	err := db.QueryRow("SELECT session_id, name, created_at, last_question, last_answer FROM sessions WHERE id = ?", idStr).Scan(&sessionID, &name, &createdAt, &lastQuestion, &lastAnswer)
 	if err == sql.ErrNoRows {
 		http.NotFound(w, r)
 		return
@@ -397,10 +400,12 @@ func handleGetSession(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"id":         idStr,
-		"name":       name,
-		"session_id": sessionID,
-		"created_at": createdAt,
-		"events":     events,
+		"id":            idStr,
+		"name":          name,
+		"session_id":    sessionID,
+		"created_at":    createdAt,
+		"last_question": lastQuestion,
+		"last_answer":   lastAnswer,
+		"events":        events,
 	})
 }
