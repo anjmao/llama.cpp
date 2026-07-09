@@ -140,6 +140,9 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // optional client-provided identifier, used to correlate MoE router events
+    std::string session_id;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling

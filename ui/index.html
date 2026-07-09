@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MoE Router Visualizer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .expert-grid {
+      display: grid;
+      gap: 1px;
+    }
+    .expert-cell {
+      aspect-ratio: 1;
+      min-width: 18px;
+      min-height: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 9px;
+      color: rgba(0,0,0,0.6);
+      border-radius: 2px;
+      cursor: default;
+      transition: background-color 0.15s;
+    }
+    .expert-cell.selected {
+      outline: 1px solid rgba(59, 130, 246, 0.8);
+      outline-offset: -1px;
+    }
+    .expert-cell.current {
+      box-shadow: inset 0 0 0 1px #1d4ed8;
+    }
+    .layer-label {
+      min-width: 48px;
+      font-size: 10px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+    }
+    .expert-header {
+      min-width: 18px;
+      font-size: 9px;
+      text-align: center;
+      color: #6b7280;
+    }
+    .backend-badge {
+      font-size: 9px;
+      padding: 1px 4px;
+      border-radius: 999px;
+      margin-left: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }
+    .backend-gpu { background: #dbeafe; color: #1e40af; }
+    .backend-cpu { background: #fee2e2; color: #991b1b; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900 min-h-screen">
+  <div class="max-w-[1600px] mx-auto p-4">
+    <header class="mb-4 flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <h1 class="text-2xl font-bold">MoE Router Visualizer</h1>
+        <p class="text-sm text-gray-500">Stream from <code class="bg-gray-200 px-1 rounded">/v1/moe/routed-experts</code></p>
+      </div>
+      <div class="flex items-center gap-3">
+        <div id="status" class="text-sm font-medium px-3 py-1 rounded-full bg-gray-200 text-gray-700">Disconnected</div>
+        <button id="clearBtn" class="px-4 py-2 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-md text-sm font-medium">Clear</button>
+      </div>
+      <div class="w-full flex flex-wrap items-center gap-3 text-sm">
+        <label for="sessionId" class="font-medium">Session ID:</label>
+        <input id="sessionId" type="text" class="px-2 py-1 border border-gray-300 rounded-md font-mono text-xs w-64" placeholder="auto-generated">
+        <button id="newSessionBtn" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">New session</button>
+        <button id="copySessionBtn" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">Copy</button>
+        <button id="saveSessionBtn" class="px-3 py-1 bg-green-100 hover:bg-green-200 text-green-900 rounded text-xs font-medium">Save Session</button>
+        <button id="historyBtn" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">History</button>
+      </div>
+      <div id="connectionHint" class="w-full text-xs text-gray-500 hidden">
+        The browser keeps the SSE request open while waiting for the llama-server to process a chat completion. Use the Session ID below in your request to correlate events.
+      </div>
+    </header>
+
+    <div class="bg-white rounded-lg shadow p-4 mb-4">
+      <h2 class="text-lg font-semibold mb-2">Chat</h2>
+      <div class="text-xs text-gray-500 mb-2">Send a prompt to the backend using the current Session ID</div>
+      <div class="flex flex-col gap-3">
+        <textarea id="chatInput" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Type a prompt..."></textarea>
+        <div class="flex items-center gap-3">
+          <button id="chatSendBtn" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-md text-sm font-medium">Send</button>
+          <span id="chatStatus" class="text-sm text-gray-500"></span>
+        </div>
+      </div>
+      <div id="chatResponse" class="mt-3 max-h-64 overflow-y-auto text-sm whitespace-pre-wrap border border-gray-200 rounded-md p-3 bg-gray-50 hidden"></div>
+    </div>
+
+    <div class="bg-white rounded-lg shadow p-4 mb-4">
+      <div class="flex flex-wrap items-center justify-between gap-4 mb-3">
+        <div class="text-sm">
+          <span class="font-semibold">Tokens:</span> <span id="tokenCount">0</span>
+          <span class="mx-2 text-gray-300">|</span>
+          <span class="font-semibold">Events:</span> <span id="eventCount">0</span>
+          <span class="mx-2 text-gray-300">|</span>
+          <span class="font-semibold">Max layer:</span> <span id="maxLayer">-</span>
+          <span class="mx-2 text-gray-300">|</span>
+          <span class="font-semibold">Max expert:</span> <span id="maxExpert">-</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="playBtn" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium disabled:opacity-50">Play</button>
+          <label class="text-sm font-medium">Token:</label>
+          <input id="tokenSlider" type="range" min="0" max="0" value="0" class="w-64 accent-blue-600" disabled>
+          <span id="currentToken" class="text-sm font-mono w-20 text-right">-</span>
+        </div>
+      </div>
+      <div class="text-xs text-gray-500">
+        Use the slider to scrub through token history. The top grid shows selections up to the current token; the bottom grid shows cumulative selections for the whole prompt.
+      </div>
+    </div>
+
+    <div class="flex flex-col gap-4">
+      <div class="bg-white rounded-lg shadow p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-lg font-semibold">Current position</h2>
+          <div class="text-xs text-gray-500">Experts selected up to current token</div>
+        </div>
+        <div id="currentGrid" class="overflow-x-auto">
+          <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-lg shadow p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-lg font-semibold">Cumulative</h2>
+          <div class="text-xs text-gray-500">Total selections across whole prompt</div>
+        </div>
+        <div id="cumulativeGrid" class="overflow-x-auto">
+          <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-4 bg-white rounded-lg shadow p-4">
+      <h2 class="text-lg font-semibold mb-2">Backend residency</h2>
+      <div class="text-xs text-gray-500 mb-2">Per-layer tensor placement reported by the server</div>
+      <div id="backendLegend" class="flex flex-wrap gap-2"></div>
+    </div>
+  </div>
+
+  <div id="saveModal" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
+    <div class="bg-white rounded-lg shadow-lg p-6 w-full max-w-md">
+      <h3 class="text-lg font-semibold mb-3">Save Session</h3>
+      <label class="block text-sm font-medium text-gray-700 mb-1">Name</label>
+      <input id="saveSessionName" type="text" class="w-full px-3 py-2 border border-gray-300 rounded-md text-sm mb-4" placeholder="e.g. prompt about bash one-liner">
+      <div class="flex justify-end gap-2">
+        <button id="cancelSaveBtn" class="px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-md text-sm">Cancel</button>
+        <button id="confirmSaveBtn" class="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-md text-sm">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="historyPanel" class="fixed inset-0 bg-black bg-opacity-50 hidden items-center justify-center z-50">
+    <div class="bg-white rounded-lg shadow-lg p-6 w-full max-w-2xl max-h-[80vh] flex flex-col">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Saved Sessions</h3>
+        <button id="closeHistoryBtn" class="text-gray-500 hover:text-gray-700 text-xl">&times;</button>
+      </div>
+      <div id="historyList" class="overflow-y-auto flex-1">
+        <div class="text-sm text-gray-400 italic p-4 text-center">No saved sessions</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      connected: false,
+      source: null,
+      events: [],
+      tokens: [],
+      tokenSet: new Set(),
+      maxLayer: -1,
+      maxExpert: -1,
+      currentTokenIndex: 0,
+      playing: false,
+      playInterval: null,
+      backendByLayer: {},
+      renderScheduled: false,
+      sessionId: generateSessionId(),
+      chatStreaming: false
+    };
+
+    const els = {
+      status: document.getElementById('status'),
+      connectionHint: document.getElementById('connectionHint'),
+      sessionIdInput: document.getElementById('sessionId'),
+      newSessionBtn: document.getElementById('newSessionBtn'),
+      copySessionBtn: document.getElementById('copySessionBtn'),
+      saveSessionBtn: document.getElementById('saveSessionBtn'),
+      historyBtn: document.getElementById('historyBtn'),
+      clearBtn: document.getElementById('clearBtn'),
+      saveModal: document.getElementById('saveModal'),
+      saveSessionName: document.getElementById('saveSessionName'),
+      confirmSaveBtn: document.getElementById('confirmSaveBtn'),
+      cancelSaveBtn: document.getElementById('cancelSaveBtn'),
+      historyPanel: document.getElementById('historyPanel'),
+      historyList: document.getElementById('historyList'),
+      closeHistoryBtn: document.getElementById('closeHistoryBtn'),
+      playBtn: document.getElementById('playBtn'),
+      tokenSlider: document.getElementById('tokenSlider'),
+      currentToken: document.getElementById('currentToken'),
+      tokenCount: document.getElementById('tokenCount'),
+      eventCount: document.getElementById('eventCount'),
+      maxLayer: document.getElementById('maxLayer'),
+      maxExpert: document.getElementById('maxExpert'),
+      currentGrid: document.getElementById('currentGrid'),
+      cumulativeGrid: document.getElementById('cumulativeGrid'),
+      backendLegend: document.getElementById('backendLegend'),
+      chatInput: document.getElementById('chatInput'),
+      chatSendBtn: document.getElementById('chatSendBtn'),
+      chatStatus: document.getElementById('chatStatus'),
+      chatResponse: document.getElementById('chatResponse')
+    };
+
+    function generateSessionId() {
+      return 'sess-' + Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+    }
+
+    function connect() {
+      if (state.source) return;
+
+      const sessionId = els.sessionIdInput.value.trim();
+      const url = sessionId
+        ? '/v1/moe/routed-experts?session_id=' + encodeURIComponent(sessionId)
+        : '/v1/moe/routed-experts';
+
+      els.status.textContent = 'Connecting...';
+      els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-yellow-100 text-yellow-800';
+
+      const source = new EventSource(url);
+      state.source = source;
+
+      source.onopen = () => {
+        console.log('EventSource open')
+        state.connected = true;
+        if (state.events.length === 0) {
+          els.status.textContent = 'Connected, waiting for events...';
+          els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-blue-100 text-blue-800';
+          els.connectionHint.classList.remove('hidden');
+        } else {
+          els.status.textContent = 'Receiving events';
+          els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-green-100 text-green-800';
+        }
+      };
+
+      source.onmessage = (e) => {
+        if (!e.data || e.data.trim() === '') return;
+        try {
+          const data = JSON.parse(e.data);
+          handleEvent(data);
+          els.status.textContent = 'Receiving events';
+          els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-green-100 text-green-800';
+          els.connectionHint.classList.add('hidden');
+        } catch (err) {
+          console.warn('failed to parse event', e.data, err);
+        }
+      };
+
+      source.onerror = () => {
+        disconnect();
+        els.status.textContent = 'Error / Reconnecting...';
+        els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-red-100 text-red-800';
+      };
+    }
+
+    function disconnect() {
+      if (state.source) {
+        state.source.close();
+        state.source = null;
+      }
+      state.connected = false;
+      els.status.textContent = 'Disconnected';
+      els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-gray-200 text-gray-700';
+    }
+
+    function handleEvent(data) {
+      state.events.push(data);
+
+      if (!state.tokenSet.has(data.token_id)) {
+        state.tokenSet.add(data.token_id);
+        state.tokens.push(data.token_id);
+        state.tokens.sort((a, b) => a - b);
+      }
+
+      state.maxLayer = Math.max(state.maxLayer, data.layer);
+      data.experts.forEach(e => {
+        state.maxExpert = Math.max(state.maxExpert, e);
+      });
+
+      if (data.backend) {
+        state.backendByLayer[data.layer] = data.backend;
+      }
+
+      scheduleRender();
+    }
+
+    function updateSlider() {
+      const max = Math.max(0, state.tokens.length - 1);
+      els.tokenSlider.max = max;
+      els.tokenSlider.disabled = state.tokens.length === 0;
+      els.playBtn.disabled = state.tokens.length === 0;
+
+      if (state.currentTokenIndex > max) {
+        state.currentTokenIndex = max;
+      }
+      els.tokenSlider.value = state.currentTokenIndex;
+    }
+
+    function scheduleRender() {
+      if (state.renderScheduled) return;
+      state.renderScheduled = true;
+      requestAnimationFrame(() => {
+        state.renderScheduled = false;
+        updateSlider();
+        render();
+      });
+    }
+
+    function render() {
+      els.tokenCount.textContent = state.tokens.length;
+      els.eventCount.textContent = state.events.length;
+      els.maxLayer.textContent = state.maxLayer >= 0 ? state.maxLayer : '-';
+      els.maxExpert.textContent = state.maxExpert >= 0 ? state.maxExpert : '-';
+
+      const currentTokenId = state.tokens[state.currentTokenIndex];
+      els.currentToken.textContent = currentTokenId !== undefined ? currentTokenId : '-';
+
+      const currentEvents = state.tokens.length > 0
+        ? state.events.filter(e => e.token_id <= currentTokenId)
+        : [];
+
+      renderGrid(els.currentGrid, currentEvents, true, currentTokenId);
+      renderGrid(els.cumulativeGrid, state.events, false, currentTokenId);
+      renderBackendLegend();
+    }
+
+    function renderGrid(container, events, isCurrent, currentTokenId) {
+      if (state.maxLayer < 0 || state.maxExpert < 0) {
+        container.innerHTML = '<div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>';
+        return;
+      }
+
+      const layers = [];
+      for (let i = 0; i <= state.maxLayer; i++) layers.push(i);
+      const experts = [];
+      for (let i = 0; i <= state.maxExpert; i++) experts.push(i);
+
+      const counts = new Map();
+      events.forEach(e => {
+        e.experts.forEach(ex => {
+          const key = `${e.layer}:${ex}`;
+          counts.set(key, (counts.get(key) || 0) + 1);
+        });
+      });
+
+      const currentSelectedByLayer = new Map();
+      if (isCurrent && currentTokenId !== undefined) {
+        events.forEach(e => {
+          if (e.token_id === currentTokenId) {
+            let selected = currentSelectedByLayer.get(e.layer);
+            if (!selected) {
+              selected = new Set();
+              currentSelectedByLayer.set(e.layer, selected);
+            }
+            e.experts.forEach(ex => selected.add(ex));
+          }
+        });
+      }
+
+      const maxCount = Math.max(1, ...counts.values());
+
+      const root = document.createElement('div');
+      root.className = 'expert-grid';
+      root.style.gridTemplateColumns = `48px repeat(${experts.length}, minmax(18px, 1fr))`;
+
+      const headerRow = document.createElement('div');
+      headerRow.className = 'layer-label';
+      headerRow.textContent = 'Layer';
+      root.appendChild(headerRow);
+
+      experts.forEach(ex => {
+        const th = document.createElement('div');
+        th.className = 'expert-header';
+        th.textContent = ex;
+        root.appendChild(th);
+      });
+
+      layers.forEach(layer => {
+        const backend = state.backendByLayer[layer];
+        const badgeClass = backend && backend.ffn_down_exps === 'gpu' ? 'backend-gpu' : 'backend-cpu';
+        const badgeText = backend && backend.ffn_down_exps === 'gpu' ? 'gpu' : 'cpu';
+
+        const label = document.createElement('div');
+        label.className = 'layer-label';
+        label.innerHTML = `<span>L${layer}</span><span class="backend-badge ${badgeClass}">${badgeText}</span>`;
+        root.appendChild(label);
+
+        experts.forEach(ex => {
+          const key = `${layer}:${ex}`;
+          const count = counts.get(key) || 0;
+          const cell = document.createElement('div');
+          cell.className = 'expert-cell';
+          cell.title = `layer ${layer}, expert ${ex}${count ? ', count: ' + count : ''}`;
+          cell.textContent = ex;
+
+          if (count > 0) {
+            const intensity = Math.min(1, count / maxCount);
+            const hue = 217;
+            const sat = 90;
+            const light = 95 - intensity * 45;
+            cell.style.backgroundColor = `hsl(${hue}, ${sat}%, ${light}%)`;
+            cell.classList.add('selected');
+          } else {
+            cell.classList.add('bg-gray-100');
+          }
+
+          if (isCurrent) {
+            const selected = currentSelectedByLayer.get(layer);
+            if (selected && selected.has(ex)) {
+              cell.classList.add('current');
+            }
+          }
+
+          root.appendChild(cell);
+        });
+      });
+
+      container.innerHTML = '';
+      container.appendChild(root);
+    }
+
+    function renderBackendLegend() {
+      if (Object.keys(state.backendByLayer).length === 0) {
+        els.backendLegend.innerHTML = '<span class="text-sm text-gray-400">No backend data yet</span>';
+        return;
+      }
+
+      const keys = ['ffn_down_exps', 'ffn_gate_up_exps', 'ffn_up_exps', 'ffn_gate_exps'];
+      const labels = {
+        ffn_down_exps: 'down',
+        ffn_gate_up_exps: 'gate_up',
+        ffn_up_exps: 'up',
+        ffn_gate_exps: 'gate'
+      };
+
+      const legend = document.createElement('div');
+      legend.className = 'flex flex-col gap-2';
+
+      const header = document.createElement('div');
+      header.className = 'grid gap-1 text-xs font-semibold text-gray-600';
+      header.style.gridTemplateColumns = '60px repeat(4, 60px)';
+      header.innerHTML = '<span>Layer</span>' + keys.map(k => `<span>${labels[k]}</span>`).join('');
+      legend.appendChild(header);
+
+      Object.keys(state.backendByLayer)
+        .map(Number)
+        .sort((a, b) => a - b)
+        .forEach(layer => {
+          const row = document.createElement('div');
+          row.className = 'grid gap-1 text-xs';
+          row.style.gridTemplateColumns = '60px repeat(4, 60px)';
+
+          let html = `<span class="font-medium">L${layer}</span>`;
+          keys.forEach(k => {
+            const val = state.backendByLayer[layer][k] || 'cpu';
+            const cls = val === 'gpu' ? 'backend-gpu' : 'backend-cpu';
+            html += `<span class="backend-badge ${cls}">${val}</span>`;
+          });
+          row.innerHTML = html;
+          legend.appendChild(row);
+        });
+
+      els.backendLegend.innerHTML = '';
+      els.backendLegend.appendChild(legend);
+    }
+
+    function clear() {
+      state.events = [];
+      state.tokens = [];
+      state.tokenSet.clear();
+      state.maxLayer = -1;
+      state.maxExpert = -1;
+      state.currentTokenIndex = 0;
+      state.backendByLayer = {};
+      stopPlay();
+      updateSlider();
+      scheduleRender();
+    }
+
+    function stopPlay() {
+      state.playing = false;
+      els.playBtn.textContent = 'Play';
+      if (state.playInterval) {
+        clearInterval(state.playInterval);
+        state.playInterval = null;
+      }
+    }
+
+    function togglePlay() {
+      if (state.playing) {
+        stopPlay();
+        return;
+      }
+      if (state.tokens.length === 0) return;
+      state.playing = true;
+      els.playBtn.textContent = 'Pause';
+      state.playInterval = setInterval(() => {
+        if (state.currentTokenIndex >= state.tokens.length - 1) {
+          state.currentTokenIndex = 0;
+        } else {
+          state.currentTokenIndex++;
+        }
+        els.tokenSlider.value = state.currentTokenIndex;
+        render();
+      }, 200);
+    }
+
+    els.clearBtn.addEventListener('click', clear);
+
+    function openSaveModal() {
+      els.saveSessionName.value = '';
+      els.saveModal.classList.remove('hidden');
+      els.saveModal.classList.add('flex');
+      els.saveSessionName.focus();
+    }
+
+    function closeSaveModal() {
+      els.saveModal.classList.add('hidden');
+      els.saveModal.classList.remove('flex');
+    }
+
+    async function confirmSaveSession() {
+      const name = els.saveSessionName.value.trim();
+      if (!name) return;
+
+      els.confirmSaveBtn.disabled = true;
+      els.confirmSaveBtn.textContent = 'Saving...';
+
+      try {
+        const response = await fetch('/v1/moe/save-session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: name,
+            session_id: state.sessionId,
+            events: state.events
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error('Save failed: ' + await response.text());
+        }
+
+        closeSaveModal();
+      } catch (err) {
+        alert(err.message);
+      } finally {
+        els.confirmSaveBtn.disabled = false;
+        els.confirmSaveBtn.textContent = 'Save';
+      }
+    }
+
+    function openHistoryPanel() {
+      els.historyPanel.classList.remove('hidden');
+      els.historyPanel.classList.add('flex');
+      loadHistory();
+    }
+
+    function closeHistoryPanel() {
+      els.historyPanel.classList.add('hidden');
+      els.historyPanel.classList.remove('flex');
+    }
+
+    async function loadHistory() {
+      try {
+        const response = await fetch('/v1/moe/sessions');
+        if (!response.ok) throw new Error('Failed to load history');
+        const sessions = await response.json();
+        renderHistoryList(sessions);
+      } catch (err) {
+        els.historyList.innerHTML = '<div class="text-sm text-red-500 p-4 text-center">' + err.message + '</div>';
+      }
+    }
+
+    function renderHistoryList(sessions) {
+      if (!sessions || sessions.length === 0) {
+        els.historyList.innerHTML = '<div class="text-sm text-gray-400 italic p-4 text-center">No saved sessions</div>';
+        return;
+      }
+
+      const root = document.createElement('div');
+      root.className = 'flex flex-col gap-2';
+
+      sessions.forEach(s => {
+        const row = document.createElement('div');
+        row.className = 'flex items-center justify-between p-3 border border-gray-200 rounded-md hover:bg-gray-50';
+        row.innerHTML = `
+          <div class="flex flex-col">
+            <span class="font-medium text-sm">${escapeHtml(s.name)}</span>
+            <span class="text-xs text-gray-500">${escapeHtml(s.session_id)} · ${new Date(s.created_at).toLocaleString()} · ${s.event_count} events</span>
+          </div>
+          <button class="load-session-btn px-3 py-1 bg-blue-100 hover:bg-blue-200 text-blue-900 rounded text-xs font-medium" data-id="${s.id}">Load</button>
+        `;
+        root.appendChild(row);
+      });
+
+      root.addEventListener('click', (e) => {
+        if (e.target.classList.contains('load-session-btn')) {
+          const id = e.target.getAttribute('data-id');
+          loadSavedSession(id);
+        }
+      });
+
+      els.historyList.innerHTML = '';
+      els.historyList.appendChild(root);
+    }
+
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    async function loadSavedSession(id) {
+      try {
+        const response = await fetch('/v1/moe/sessions/' + id);
+        if (!response.ok) throw new Error('Failed to load session');
+        const data = await response.json();
+
+        disconnect();
+        clear();
+        state.sessionId = data.session_id;
+        els.sessionIdInput.value = data.session_id;
+
+        data.events.forEach(ev => handleEvent(ev));
+
+        els.status.textContent = 'Loaded: ' + data.name;
+        els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-purple-100 text-purple-800';
+        closeHistoryPanel();
+      } catch (err) {
+        alert(err.message);
+      }
+    }
+
+    els.saveSessionBtn.addEventListener('click', openSaveModal);
+    els.cancelSaveBtn.addEventListener('click', closeSaveModal);
+    els.confirmSaveBtn.addEventListener('click', confirmSaveSession);
+    els.historyBtn.addEventListener('click', openHistoryPanel);
+    els.closeHistoryBtn.addEventListener('click', closeHistoryPanel);
+
+    async function sendChat() {
+      const prompt = els.chatInput.value.trim();
+      if (!prompt || state.chatStreaming) return;
+
+      state.chatStreaming = true;
+      els.chatSendBtn.disabled = true;
+      els.chatStatus.textContent = 'Sending...';
+      els.chatResponse.classList.remove('hidden');
+      els.chatResponse.textContent = '';
+
+      const sessionId = els.sessionIdInput.value.trim();
+      const body = JSON.stringify({
+        messages: [{ role: 'user', content: prompt }],
+        stream: true,
+        session_id: sessionId
+      });
+
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`HTTP ${response.status}: ${text}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let content = '';
+
+        els.chatStatus.textContent = 'Streaming...';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) continue;
+            const data = trimmed.slice(5).trim();
+            if (data === '[DONE]') continue;
+
+            try {
+              const chunk = JSON.parse(data);
+              const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+              if (delta && delta.content) {
+                content += delta.content;
+                els.chatResponse.textContent = content;
+                els.chatResponse.scrollTop = els.chatResponse.scrollHeight;
+              }
+            } catch (e) {
+              // ignore malformed chunks
+            }
+          }
+        }
+
+        els.chatStatus.textContent = 'Done';
+      } catch (err) {
+        els.chatStatus.textContent = 'Error';
+        els.chatResponse.textContent = 'Error: ' + err.message;
+        console.error(err);
+      } finally {
+        state.chatStreaming = false;
+        els.chatSendBtn.disabled = false;
+      }
+    }
+
+    els.chatSendBtn.addEventListener('click', sendChat);
+    els.chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChat();
+      }
+    });
+
+    els.newSessionBtn.addEventListener('click', () => {
+      state.sessionId = generateSessionId();
+      els.sessionIdInput.value = state.sessionId;
+      disconnect();
+      connect();
+    });
+
+    els.copySessionBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(els.sessionIdInput.value).catch(() => {});
+    });
+
+    els.sessionIdInput.value = state.sessionId;
+    connect();
+
+    els.tokenSlider.addEventListener('input', (e) => {
+      state.currentTokenIndex = parseInt(e.target.value, 10);
+      scheduleRender();
+    });
+
+    els.playBtn.addEventListener('click', togglePlay);
+
+    scheduleRender();
+  </script>
+</body>
+</html>
