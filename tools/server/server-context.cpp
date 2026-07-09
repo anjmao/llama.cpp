@@ -10,6 +10,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-model.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -62,9 +63,14 @@ struct server_moe_router_sample {
     int layer;
     llama_token token_id;
     std::vector<int32_t> experts;
+    bool down_exps_host   = false;
+    bool gate_up_exps_host = false;
+    bool up_exps_host     = false;
+    bool gate_exps_host   = false;
 };
 
 struct server_moe_router_state {
+    const llama_model * model = nullptr;
     std::vector<llama_token> tokens;
 
     mutable std::mutex mutex;
@@ -119,12 +125,32 @@ static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_d
 
     const int32_t * experts = reinterpret_cast<const int32_t *>(data.data());
 
+    bool down_host     = false;
+    bool gate_up_host  = false;
+    bool up_host       = false;
+    bool gate_host     = false;
+
+    if (state->model != nullptr && layer >= 0 && layer < (int) state->model->layers.size()) {
+        const auto & layer_tensors = state->model->layers[layer];
+        auto is_host = [](const ggml_tensor * tensor) -> bool {
+            return tensor != nullptr && tensor->buffer != nullptr && ggml_backend_buffer_is_host(tensor->buffer);
+        };
+        down_host    = is_host(layer_tensors.ffn_down_exps);
+        gate_up_host = is_host(layer_tensors.ffn_gate_up_exps);
+        up_host      = is_host(layer_tensors.ffn_up_exps);
+        gate_host    = is_host(layer_tensors.ffn_gate_exps);
+    }
+
     for (int64_t tok = 0; tok < n_tokens; ++tok) {
         const llama_token token_id = (tok < (int64_t) state->tokens.size()) ? state->tokens[tok] : -1;
 
         server_moe_router_sample sample;
         sample.layer = layer;
         sample.token_id = token_id;
+        sample.down_exps_host    = down_host;
+        sample.gate_up_exps_host = gate_up_host;
+        sample.up_exps_host      = up_host;
+        sample.gate_exps_host    = gate_host;
         sample.experts.reserve(n_expert_used);
         for (int64_t k = 0; k < n_expert_used; ++k) {
             sample.experts.push_back(experts[tok * n_expert_used + k]);
@@ -1261,6 +1287,8 @@ private:
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
         }
+
+        moe_router_state.model = model_tgt;
 
         vocab = llama_model_get_vocab(model_tgt);
 
@@ -5200,6 +5228,14 @@ void server_routes::init_routes() {
                 j["layer"] = s.layer;
                 j["token_id"] = s.token_id;
                 j["experts"] = s.experts;
+
+                json backend;
+                backend["ffn_down_exps"]    = s.down_exps_host    ? "cpu" : "gpu";
+                backend["ffn_gate_up_exps"] = s.gate_up_exps_host ? "cpu" : "gpu";
+                backend["ffn_up_exps"]      = s.up_exps_host      ? "cpu" : "gpu";
+                backend["ffn_gate_exps"]    = s.gate_exps_host    ? "cpu" : "gpu";
+                j["backend"] = backend;
+
                 chunk += "data: " + j.dump() + "\n\n";
             }
 

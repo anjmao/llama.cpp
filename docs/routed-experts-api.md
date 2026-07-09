@@ -19,15 +19,27 @@ Each event contains a JSON object with the following fields:
 | `layer`    | integer          | Transformer layer index that produced the routing decision.             |
 | `token_id` | integer          | The actual tokenizer token ID that was routed through that layer.       |
 | `experts`  | array of integers| Selected expert indices, ordered by router score (highest score first). |
+| `backend`  | object           | Residency (`cpu` or `gpu`) of each expert weight tensor in the layer.   |
+
+The `backend` object has one entry for each possible expert weight tensor:
+
+| Key                 | Value  | Tensor checked                                   |
+|---------------------|--------|--------------------------------------------------|
+| `ffn_down_exps`     | `cpu` or `gpu` | `blk.<layer>.ffn_down_exps.weight`      |
+| `ffn_gate_up_exps`  | `cpu` or `gpu` | `blk.<layer>.ffn_gate_up_exps.weight`   |
+| `ffn_up_exps`       | `cpu` or `gpu` | `blk.<layer>.ffn_up_exps.weight`        |
+| `ffn_gate_exps`     | `cpu` or `gpu` | `blk.<layer>.ffn_gate_exps.weight`      |
+
+If a tensor does not exist for the current architecture, its value defaults to `cpu`.
 
 Example stream:
 
 ```text
-data: {"layer":15,"token_id":15,"experts":[52,8,58,30,60,4,16,17]}
+data: {"layer":15,"token_id":15,"experts":[52,8,58,30,60,4,16,17],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
 
-data: {"layer":16,"token_id":15,"experts":[14,46,43,30,58,38,61,4]}
+data: {"layer":16,"token_id":15,"experts":[14,46,43,30,58,38,61,4],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
 
-data: {"layer":17,"token_id":15,"experts":[54,3,53,56,8,23,0,42]}
+data: {"layer":17,"token_id":15,"experts":[54,3,53,56,8,23,0,42],"backend":{"ffn_down_exps":"gpu","ffn_gate_up_exps":"gpu","ffn_up_exps":"cpu","ffn_gate_exps":"cpu"}}
 ```
 
 For MoE models such as `allenai/OLMoE-1B-7B-0924`, the `experts` array typically contains 8 indices drawn from a pool of 64 experts.
