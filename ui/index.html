@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MoE Router Visualizer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .expert-grid {
+      display: grid;
+      gap: 1px;
+    }
+    .expert-cell {
+      aspect-ratio: 1;
+      min-width: 18px;
+      min-height: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 9px;
+      color: rgba(0,0,0,0.6);
+      border-radius: 2px;
+      cursor: default;
+      transition: background-color 0.15s;
+    }
+    .expert-cell.selected {
+      outline: 1px solid rgba(59, 130, 246, 0.8);
+      outline-offset: -1px;
+    }
+    .expert-cell.current {
+      box-shadow: inset 0 0 0 1px #1d4ed8;
+    }
+    .layer-label {
+      min-width: 48px;
+      font-size: 10px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+    }
+    .expert-header {
+      min-width: 18px;
+      font-size: 9px;
+      text-align: center;
+      color: #6b7280;
+    }
+    .backend-badge {
+      font-size: 9px;
+      padding: 1px 4px;
+      border-radius: 999px;
+      margin-left: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }
+    .backend-gpu { background: #dbeafe; color: #1e40af; }
+    .backend-cpu { background: #fee2e2; color: #991b1b; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900 min-h-screen">
+  <div class="max-w-[1600px] mx-auto p-4">
+    <header class="mb-4 flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <h1 class="text-2xl font-bold">MoE Router Visualizer</h1>
+        <p class="text-sm text-gray-500">Stream from <code class="bg-gray-200 px-1 rounded">/v1/moe/routed-experts</code></p>
+      </div>
+      <div class="flex items-center gap-3">
+        <div id="status" class="text-sm font-medium px-3 py-1 rounded-full bg-gray-200 text-gray-700">Disconnected</div>
+        <button id="clearBtn" class="px-4 py-2 bg-white border border-gray-300 hover:bg-gray-50 text-gray-700 rounded-md text-sm font-medium">Clear</button>
+      </div>
+      <div id="connectionHint" class="w-full text-xs text-gray-500 hidden">
+        The browser keeps the SSE request open while waiting for the llama-server to process a chat completion. Send a chat completion request to see events.
+      </div>
+    </header>
+
+    <div class="bg-white rounded-lg shadow p-4 mb-4">
+      <div class="flex flex-wrap items-center justify-between gap-4 mb-3">
+        <div class="text-sm">
+          <span class="font-semibold">Tokens:</span> <span id="tokenCount">0</span>
+          <span class="mx-2 text-gray-300">|</span>
+          <span class="font-semibold">Events:</span> <span id="eventCount">0</span>
+          <span class="mx-2 text-gray-300">|</span>
+          <span class="font-semibold">Max layer:</span> <span id="maxLayer">-</span>
+          <span class="mx-2 text-gray-300">|</span>
+          <span class="font-semibold">Max expert:</span> <span id="maxExpert">-</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="playBtn" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium disabled:opacity-50">Play</button>
+          <label class="text-sm font-medium">Token:</label>
+          <input id="tokenSlider" type="range" min="0" max="0" value="0" class="w-64 accent-blue-600" disabled>
+          <span id="currentToken" class="text-sm font-mono w-20 text-right">-</span>
+        </div>
+      </div>
+      <div class="text-xs text-gray-500">
+        Use the slider to scrub through token history. The top grid shows selections up to the current token; the bottom grid shows cumulative selections for the whole prompt.
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+      <div class="bg-white rounded-lg shadow p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-lg font-semibold">Current position</h2>
+          <div class="text-xs text-gray-500">Experts selected up to current token</div>
+        </div>
+        <div id="currentGrid" class="overflow-x-auto">
+          <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+        </div>
+      </div>
+
+      <div class="bg-white rounded-lg shadow p-4">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-lg font-semibold">Cumulative</h2>
+          <div class="text-xs text-gray-500">Total selections across whole prompt</div>
+        </div>
+        <div id="cumulativeGrid" class="overflow-x-auto">
+          <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-4 bg-white rounded-lg shadow p-4">
+      <h2 class="text-lg font-semibold mb-2">Backend residency</h2>
+      <div class="text-xs text-gray-500 mb-2">Per-layer tensor placement reported by the server</div>
+      <div id="backendLegend" class="flex flex-wrap gap-2"></div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      connected: false,
+      source: null,
+      events: [],
+      tokens: [],
+      tokenSet: new Set(),
+      maxLayer: -1,
+      maxExpert: -1,
+      currentTokenIndex: 0,
+      playing: false,
+      playInterval: null,
+      backendByLayer: {}
+    };
+
+    const els = {
+      status: document.getElementById('status'),
+      connectionHint: document.getElementById('connectionHint'),
+      clearBtn: document.getElementById('clearBtn'),
+      playBtn: document.getElementById('playBtn'),
+      tokenSlider: document.getElementById('tokenSlider'),
+      currentToken: document.getElementById('currentToken'),
+      tokenCount: document.getElementById('tokenCount'),
+      eventCount: document.getElementById('eventCount'),
+      maxLayer: document.getElementById('maxLayer'),
+      maxExpert: document.getElementById('maxExpert'),
+      currentGrid: document.getElementById('currentGrid'),
+      cumulativeGrid: document.getElementById('cumulativeGrid'),
+      backendLegend: document.getElementById('backendLegend')
+    };
+
+    function connect() {
+      if (state.source) return;
+
+      els.status.textContent = 'Connecting...';
+      els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-yellow-100 text-yellow-800';
+
+      const source = new EventSource('/v1/moe/routed-experts');
+      state.source = source;
+
+      source.onopen = () => {
+        console.log('EventSource open')
+        state.connected = true;
+        if (state.events.length === 0) {
+          els.status.textContent = 'Connected, waiting for events...';
+          els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-blue-100 text-blue-800';
+          els.connectionHint.classList.remove('hidden');
+        } else {
+          els.status.textContent = 'Receiving events';
+          els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-green-100 text-green-800';
+        }
+      };
+
+      source.onmessage = (e) => {
+        if (!e.data || e.data.trim() === '') return;
+        try {
+          const data = JSON.parse(e.data);
+          handleEvent(data);
+          els.status.textContent = 'Receiving events';
+          els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-green-100 text-green-800';
+          els.connectionHint.classList.add('hidden');
+        } catch (err) {
+          console.warn('failed to parse event', e.data, err);
+        }
+      };
+
+      source.onerror = () => {
+        disconnect();
+        els.status.textContent = 'Error / Reconnecting...';
+        els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-red-100 text-red-800';
+      };
+    }
+
+    function disconnect() {
+      if (state.source) {
+        state.source.close();
+        state.source = null;
+      }
+      state.connected = false;
+      els.status.textContent = 'Disconnected';
+      els.status.className = 'text-sm font-medium px-3 py-1 rounded-full bg-gray-200 text-gray-700';
+      els.toggleBtn.textContent = 'Connect';
+    }
+
+    function handleEvent(data) {
+      state.events.push(data);
+
+      if (!state.tokenSet.has(data.token_id)) {
+        state.tokenSet.add(data.token_id);
+        state.tokens.push(data.token_id);
+        state.tokens.sort((a, b) => a - b);
+      }
+
+      state.maxLayer = Math.max(state.maxLayer, data.layer);
+      data.experts.forEach(e => {
+        state.maxExpert = Math.max(state.maxExpert, e);
+      });
+
+      if (data.backend) {
+        state.backendByLayer[data.layer] = data.backend;
+      }
+
+      updateSlider();
+      render();
+    }
+
+    function updateSlider() {
+      const max = Math.max(0, state.tokens.length - 1);
+      els.tokenSlider.max = max;
+      els.tokenSlider.disabled = state.tokens.length === 0;
+      els.playBtn.disabled = state.tokens.length === 0;
+
+      if (state.currentTokenIndex > max) {
+        state.currentTokenIndex = max;
+      }
+      els.tokenSlider.value = state.currentTokenIndex;
+    }
+
+    function render() {
+      els.tokenCount.textContent = state.tokens.length;
+      els.eventCount.textContent = state.events.length;
+      els.maxLayer.textContent = state.maxLayer >= 0 ? state.maxLayer : '-';
+      els.maxExpert.textContent = state.maxExpert >= 0 ? state.maxExpert : '-';
+
+      const currentTokenId = state.tokens[state.currentTokenIndex];
+      els.currentToken.textContent = currentTokenId !== undefined ? currentTokenId : '-';
+
+      const currentEvents = state.tokens.length > 0
+        ? state.events.filter(e => e.token_id <= currentTokenId)
+        : [];
+
+      renderGrid(els.currentGrid, currentEvents, true, currentTokenId);
+      renderGrid(els.cumulativeGrid, state.events, false, currentTokenId);
+      renderBackendLegend();
+    }
+
+    function renderGrid(container, events, isCurrent, currentTokenId) {
+      if (state.maxLayer < 0 || state.maxExpert < 0) {
+        container.innerHTML = '<div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>';
+        return;
+      }
+
+      const layers = [];
+      for (let i = 0; i <= state.maxLayer; i++) layers.push(i);
+      const experts = [];
+      for (let i = 0; i <= state.maxExpert; i++) experts.push(i);
+
+      const counts = new Map();
+      events.forEach(e => {
+        e.experts.forEach(ex => {
+          const key = `${e.layer}:${ex}`;
+          counts.set(key, (counts.get(key) || 0) + 1);
+        });
+      });
+
+      const currentSelectedByLayer = new Map();
+      if (isCurrent && currentTokenId !== undefined) {
+        events.forEach(e => {
+          if (e.token_id === currentTokenId) {
+            let selected = currentSelectedByLayer.get(e.layer);
+            if (!selected) {
+              selected = new Set();
+              currentSelectedByLayer.set(e.layer, selected);
+            }
+            e.experts.forEach(ex => selected.add(ex));
+          }
+        });
+      }
+
+      const maxCount = Math.max(1, ...counts.values());
+
+      const root = document.createElement('div');
+      root.className = 'expert-grid';
+      root.style.gridTemplateColumns = `48px repeat(${experts.length}, minmax(18px, 1fr))`;
+
+      const headerRow = document.createElement('div');
+      headerRow.className = 'layer-label';
+      headerRow.textContent = 'Layer';
+      root.appendChild(headerRow);
+
+      experts.forEach(ex => {
+        const th = document.createElement('div');
+        th.className = 'expert-header';
+        th.textContent = ex;
+        root.appendChild(th);
+      });
+
+      layers.forEach(layer => {
+        const backend = state.backendByLayer[layer];
+        const badgeClass = backend && backend.ffn_down_exps === 'gpu' ? 'backend-gpu' : 'backend-cpu';
+        const badgeText = backend && backend.ffn_down_exps === 'gpu' ? 'gpu' : 'cpu';
+
+        const label = document.createElement('div');
+        label.className = 'layer-label';
+        label.innerHTML = `<span>L${layer}</span><span class="backend-badge ${badgeClass}">${badgeText}</span>`;
+        root.appendChild(label);
+
+        experts.forEach(ex => {
+          const key = `${layer}:${ex}`;
+          const count = counts.get(key) || 0;
+          const cell = document.createElement('div');
+          cell.className = 'expert-cell';
+          cell.title = `layer ${layer}, expert ${ex}${count ? ', count: ' + count : ''}`;
+          cell.textContent = ex;
+
+          if (count > 0) {
+            const intensity = Math.min(1, count / maxCount);
+            const hue = 217;
+            const sat = 90;
+            const light = 95 - intensity * 45;
+            cell.style.backgroundColor = `hsl(${hue}, ${sat}%, ${light}%)`;
+            cell.classList.add('selected');
+          } else {
+            cell.classList.add('bg-gray-100');
+          }
+
+          if (isCurrent) {
+            const selected = currentSelectedByLayer.get(layer);
+            if (selected && selected.has(ex)) {
+              cell.classList.add('current');
+            }
+          }
+
+          root.appendChild(cell);
+        });
+      });
+
+      container.innerHTML = '';
+      container.appendChild(root);
+    }
+
+    function renderBackendLegend() {
+      if (Object.keys(state.backendByLayer).length === 0) {
+        els.backendLegend.innerHTML = '<span class="text-sm text-gray-400">No backend data yet</span>';
+        return;
+      }
+
+      const keys = ['ffn_down_exps', 'ffn_gate_up_exps', 'ffn_up_exps', 'ffn_gate_exps'];
+      const labels = {
+        ffn_down_exps: 'down',
+        ffn_gate_up_exps: 'gate_up',
+        ffn_up_exps: 'up',
+        ffn_gate_exps: 'gate'
+      };
+
+      const legend = document.createElement('div');
+      legend.className = 'flex flex-col gap-2';
+
+      const header = document.createElement('div');
+      header.className = 'grid gap-1 text-xs font-semibold text-gray-600';
+      header.style.gridTemplateColumns = '60px repeat(4, 60px)';
+      header.innerHTML = '<span>Layer</span>' + keys.map(k => `<span>${labels[k]}</span>`).join('');
+      legend.appendChild(header);
+
+      Object.keys(state.backendByLayer)
+        .map(Number)
+        .sort((a, b) => a - b)
+        .forEach(layer => {
+          const row = document.createElement('div');
+          row.className = 'grid gap-1 text-xs';
+          row.style.gridTemplateColumns = '60px repeat(4, 60px)';
+
+          let html = `<span class="font-medium">L${layer}</span>`;
+          keys.forEach(k => {
+            const val = state.backendByLayer[layer][k] || 'cpu';
+            const cls = val === 'gpu' ? 'backend-gpu' : 'backend-cpu';
+            html += `<span class="backend-badge ${cls}">${val}</span>`;
+          });
+          row.innerHTML = html;
+          legend.appendChild(row);
+        });
+
+      els.backendLegend.innerHTML = '';
+      els.backendLegend.appendChild(legend);
+    }
+
+    function clear() {
+      state.events = [];
+      state.tokens = [];
+      state.tokenSet.clear();
+      state.maxLayer = -1;
+      state.maxExpert = -1;
+      state.currentTokenIndex = 0;
+      state.backendByLayer = {};
+      stopPlay();
+      updateSlider();
+      render();
+    }
+
+    function stopPlay() {
+      state.playing = false;
+      els.playBtn.textContent = 'Play';
+      if (state.playInterval) {
+        clearInterval(state.playInterval);
+        state.playInterval = null;
+      }
+    }
+
+    function togglePlay() {
+      if (state.playing) {
+        stopPlay();
+        return;
+      }
+      if (state.tokens.length === 0) return;
+      state.playing = true;
+      els.playBtn.textContent = 'Pause';
+      state.playInterval = setInterval(() => {
+        if (state.currentTokenIndex >= state.tokens.length - 1) {
+          state.currentTokenIndex = 0;
+        } else {
+          state.currentTokenIndex++;
+        }
+        els.tokenSlider.value = state.currentTokenIndex;
+        render();
+      }, 200);
+    }
+
+    els.clearBtn.addEventListener('click', clear);
+
+    connect();
+
+    els.tokenSlider.addEventListener('input', (e) => {
+      state.currentTokenIndex = parseInt(e.target.value, 10);
+      render();
+    });
+
+    els.playBtn.addEventListener('click', togglePlay);
+
+    render();
+  </script>
+</body>
+</html>
