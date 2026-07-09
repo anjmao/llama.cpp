@@ -132,13 +132,31 @@ static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_d
 
     if (state->model != nullptr && layer >= 0 && layer < (int) state->model->layers.size()) {
         const auto & layer_tensors = state->model->layers[layer];
-        auto is_host = [](const ggml_tensor * tensor) -> bool {
-            return tensor != nullptr && tensor->buffer != nullptr && ggml_backend_buffer_is_host(tensor->buffer);
+        ggml_backend_dev_t layer_dev = state->model->dev_layer(layer);
+
+        auto is_cpu_backend = [&](const ggml_tensor * tensor) -> bool {
+            if (tensor == nullptr || tensor->buffer == nullptr) {
+                return layer_dev == nullptr || ggml_backend_dev_type(layer_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            }
+
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                return true;
+            }
+
+            // non-CPU device buffer (e.g. Metal shared/mapped host memory) while the
+            // layer was assigned to CPU - report as CPU since no layer was offloaded
+            if (layer_dev != nullptr && ggml_backend_dev_type(layer_dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                return true;
+            }
+
+            return false;
         };
-        down_host    = is_host(layer_tensors.ffn_down_exps);
-        gate_up_host = is_host(layer_tensors.ffn_gate_up_exps);
-        up_host      = is_host(layer_tensors.ffn_up_exps);
-        gate_host    = is_host(layer_tensors.ffn_gate_exps);
+
+        down_host    = is_cpu_backend(layer_tensors.ffn_down_exps);
+        gate_up_host = is_cpu_backend(layer_tensors.ffn_gate_up_exps);
+        up_host      = is_cpu_backend(layer_tensors.ffn_up_exps);
+        gate_host    = is_cpu_backend(layer_tensors.ffn_gate_exps);
     }
 
     for (int64_t tok = 0; tok < n_tokens; ++tok) {

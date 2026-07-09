@@ -7,7 +7,7 @@ cmake -B build
 
 After each code change
 ```sh
-cmake --build build --config Debug -j 8c
+cmake --build build --config Debug -j 8
 ```
 
 ### Testing

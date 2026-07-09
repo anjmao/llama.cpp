@@ -30,7 +30,7 @@ The `backend` object has one entry for each possible expert weight tensor:
 | `ffn_up_exps`       | `cpu` or `gpu` | `blk.<layer>.ffn_up_exps.weight`        |
 | `ffn_gate_exps`     | `cpu` or `gpu` | `blk.<layer>.ffn_gate_exps.weight`      |
 
-If a tensor does not exist for the current architecture, its value defaults to `cpu`.
+The reported value reflects the backend to which the layer was assigned at load time (`--n-gpu-layers`, `--override-tensor`, etc.). For backends such as Metal that allocate host-accessible memory through the GPU device, the value falls back to the layer's assigned device so that `-ngl 0` reports `cpu`. If a tensor does not exist for the current architecture, its value defaults to `cpu`.
 
 Example stream:
 
