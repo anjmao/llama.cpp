@@ -34,3 +34,10 @@ Subscribe to routing trace
 ```sh
 curl http://localhost:8080/v1/moe/routed-experts
 ```
+
+Run UI
+
+```
+cd ./go
+go run .
+```
