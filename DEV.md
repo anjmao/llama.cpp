@@ -38,6 +38,20 @@ curl http://localhost:8080/v1/moe/routed-experts
 Run UI
 
 ```
-cd ./go
+cd ./ui
 go run .
 ```
+
+#### Dynamic placement test
+
+```
+./build/bin/llama serve -hf allenai/OLMoE-1B-7B-0924-Instruct-GGUF -ngl 1 -nr
+```
+
+```sh
+curl -s http://localhost:8080/v1/model/expert-placement \
+  -H 'Content-Type: application/json' \
+  -d '{"changes":[{"layer":6,"backend":"gpu"}]}'
+```
+
+In UI verify that layer was loaded to GPU
