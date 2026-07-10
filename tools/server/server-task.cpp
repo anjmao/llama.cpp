@@ -1597,6 +1597,29 @@ json server_task_result_apply_lora::to_json() {
     return json {{ "success", true }};
 }
 
+json server_task_result_expert_placement::to_json() {
+    json applied = json::array();
+    bool all_ok  = true;
+    for (const auto & c : changes) {
+        all_ok = all_ok && c.ok;
+        json j {
+            { "layer",   c.layer },
+            { "backend", c.to_gpu ? "gpu" : "cpu" },
+            { "device",  c.device },
+            { "ok",      c.ok },
+        };
+        if (!c.ok) {
+            j["error"] = c.error;
+        }
+        applied.push_back(std::move(j));
+    }
+    return json {
+        { "success",     all_ok },
+        { "granularity", "layer" },
+        { "changes",     std::move(applied) },
+    };
+}
+
 //
 // server_prompt_cache
 //

@@ -55,6 +55,9 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
+    // request a re-reserve on the next decode (e.g. after runtime tensor relocation)
+    void request_sched_reserve() { sched_need_reserve = true; }
+
     void synchronize();
 
     const llama_model   & get_model()   const;

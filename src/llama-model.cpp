@@ -1003,6 +1003,18 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    // runtime per-layer MoE expert relocation (dynamic GPU placement).
+    // records each relocatable expert tensor's load-time (CPU) backing so a move
+    // to GPU can be reverted by re-pointing at it. weights are read-only, so no
+    // copy-back is needed and the repack/mmap layout is never disturbed.
+    struct expert_reloc_slot {
+        ggml_backend_buffer_t   home_buffer = nullptr; // load-time CPU backing (master copy)
+        void *                  home_data   = nullptr;
+        ggml_backend_buffer_ptr gpu_buffer;            // cached GPU copy, owns the buffer
+        bool                    on_gpu      = false;
+    };
+    std::unordered_map<ggml_tensor *, expert_reloc_slot> expert_reloc;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1961,6 +1973,143 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
             });
 }
 
+static bool buft_is_cpu(ggml_backend_buffer_t buf) {
+    if (buf == nullptr) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+    return dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+static void gather_layer_expert_tensors(const llama_layer & l, std::vector<ggml_tensor *> & out) {
+    ggml_tensor * candidates[] = {
+        l.ffn_gate_exps,    l.ffn_up_exps,    l.ffn_down_exps,    l.ffn_gate_up_exps,
+        l.ffn_gate_exps_b,  l.ffn_up_exps_b,  l.ffn_down_exps_b,  l.ffn_gate_up_exps_b,
+        l.ffn_gate_exps_s,  l.ffn_up_exps_s,  l.ffn_down_exps_s,
+    };
+    for (ggml_tensor * t : candidates) {
+        if (t != nullptr) {
+            out.push_back(t);
+        }
+    }
+}
+
+bool llama_model::relocate_layer_experts(int il, bool to_gpu, int dev_index, std::string & err) {
+    if (il < 0 || il >= (int) layers.size()) {
+        err = "layer " + std::to_string(il) + " out of range";
+        return false;
+    }
+
+    std::vector<ggml_tensor *> tensors;
+    gather_layer_expert_tensors(layers[il], tensors);
+    if (tensors.empty()) {
+        err = "layer " + std::to_string(il) + " has no MoE expert tensors";
+        return false;
+    }
+
+    ggml_backend_buffer_type_t gpu_buft = nullptr;
+    if (to_gpu) {
+        if (dev_index < 0 || dev_index >= (int) devices.size()) {
+            err = "invalid GPU device index " + std::to_string(dev_index);
+            return false;
+        }
+        gpu_buft = ggml_backend_dev_buffer_type(devices[dev_index].dev);
+    }
+
+    // capture the load-time CPU backing on first touch, and reject unsupported source layouts
+    for (ggml_tensor * t : tensors) {
+        auto & slot = pimpl->expert_reloc[t];
+        if (slot.home_buffer == nullptr && !slot.on_gpu) {
+            if (!buft_is_cpu(t->buffer)) {
+                pimpl->expert_reloc.erase(t);
+                err = "layer " + std::to_string(il) + " experts are GPU-resident at load; "
+                      "only CPU-home experts can be relocated";
+                return false;
+            }
+            const char * name = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
+            if (name != nullptr && (strstr(name, "REPACK") != nullptr || strstr(name, "AMX") != nullptr)) {
+                pimpl->expert_reloc.erase(t);
+                err = std::string("layer ") + std::to_string(il) + " experts use a repacked CPU layout (" +
+                      name + "); relocation to GPU is not supported";
+                return false;
+            }
+            slot.home_buffer = t->buffer;
+            slot.home_data   = t->data;
+        }
+    }
+
+    // already in target state -> no-op success
+    bool all_target = true;
+    for (ggml_tensor * t : tensors) {
+        if (pimpl->expert_reloc[t].on_gpu != to_gpu) {
+            all_target = false;
+            break;
+        }
+    }
+    if (all_target) {
+        return true;
+    }
+
+    if (to_gpu) {
+        // pass 1: allocate every needed GPU buffer up-front; roll back on any failure (atomic)
+        std::vector<std::pair<ggml_tensor *, ggml_backend_buffer_t>> allocated;
+        for (ggml_tensor * t : tensors) {
+            auto & slot = pimpl->expert_reloc[t];
+            if (slot.on_gpu || slot.gpu_buffer) {
+                continue;
+            }
+            const size_t sz = ggml_backend_buft_get_alloc_size(gpu_buft, t);
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(gpu_buft, sz);
+            if (buf == nullptr) {
+                for (auto & p : allocated) {
+                    ggml_backend_buffer_free(p.second);
+                }
+                err = "failed to allocate GPU buffer for layer " + std::to_string(il);
+                return false;
+            }
+            allocated.emplace_back(t, buf);
+        }
+        for (auto & p : allocated) {
+            pimpl->expert_reloc[p.first].gpu_buffer.reset(p.second);
+        }
+
+        // pass 2: rebind + copy weights (cannot fail)
+        for (ggml_tensor * t : tensors) {
+            auto & slot = pimpl->expert_reloc[t];
+            if (slot.on_gpu) {
+                continue;
+            }
+            ggml_backend_buffer_t gbuf = slot.gpu_buffer.get();
+            t->buffer   = nullptr;
+            t->data     = nullptr;
+            ggml_backend_tensor_alloc(gbuf, t, ggml_backend_buffer_get_base(gbuf));
+            ggml_backend_tensor_set(t, slot.home_data, 0, ggml_nbytes(t));
+            slot.on_gpu = true;
+        }
+    } else {
+        // restore the load-time CPU backing (weights are unchanged, so just re-point)
+        for (ggml_tensor * t : tensors) {
+            auto & slot = pimpl->expert_reloc[t];
+            if (!slot.on_gpu) {
+                continue;
+            }
+            t->buffer   = slot.home_buffer;
+            t->data     = slot.home_data;
+            slot.on_gpu = false;
+        }
+    }
+
+    // reflect the new residency in the per-layer device so placement queries and the
+    // scheduler's layer-affinity heuristics agree with where the experts now live.
+    if (to_gpu) {
+        pimpl->dev_layer[il].dev = devices[dev_index].dev;
+    } else {
+        pimpl->dev_layer[il].dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+
+    return true;
+}
+
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
@@ -2326,6 +2475,15 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 
 int32_t llama_model_n_swa(const llama_model * model) {
     return model->hparams.n_swa;
+}
+
+bool llama_model_relocate_layer_experts(llama_model * model, int32_t il, bool to_gpu, int32_t dev_index) {
+    std::string err;
+    if (!model->relocate_layer_experts(il, to_gpu, dev_index, err)) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+        return false;
+    }
+    return true;
 }
 
 

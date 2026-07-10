@@ -631,6 +631,11 @@ struct llama_model {
 
     ggml_backend_buffer_type_t select_buft(int il) const;
 
+    // runtime relocation of a layer's MoE expert tensors between their CPU home and a GPU device.
+    // to_gpu=false restores the load-time CPU backing. Requires the experts to be CPU-resident at
+    // load time. Returns false and sets err on failure; a no-op (already on target) returns true.
+    bool relocate_layer_experts(int il, bool to_gpu, int dev_index, std::string & err);
+
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;

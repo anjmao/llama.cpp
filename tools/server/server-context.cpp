@@ -183,6 +183,24 @@ struct server_moe_router_state {
     }
 };
 
+// authoritative residency of a single expert tensor: "cpu" or "gpu".
+// mirrors the router-stats is_cpu_backend logic; a null device or a Metal host buffer
+// backing a CPU-assigned layer is reported as cpu.
+static const char * expert_backend_str(const ggml_tensor * t, ggml_backend_dev_t layer_dev) {
+    if (t == nullptr || t->buffer == nullptr) {
+        const bool cpu = layer_dev == nullptr || ggml_backend_dev_type(layer_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        return cpu ? "cpu" : "gpu";
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return "cpu";
+    }
+    if (layer_dev != nullptr && ggml_backend_dev_type(layer_dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return "cpu";
+    }
+    return "gpu";
+}
+
 static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * state = static_cast<server_moe_router_state *>(user_data);
 
@@ -225,7 +243,8 @@ static bool server_moe_router_cb(struct ggml_tensor * t, bool ask, void * user_d
             }
 
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            // a null device means a host/mmap buffer with no backing device -> CPU
+            if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 return true;
             }
 
@@ -2928,6 +2947,32 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_EXPERT_PLACEMENT:
+                {
+                    auto res = std::make_unique<server_task_result_expert_placement>();
+                    res->id = task.id;
+                    bool any_applied = false;
+                    for (const auto & c : task.expert_placement) {
+                        server_task_result_expert_placement::change_result r;
+                        r.layer  = c.layer;
+                        r.to_gpu = c.to_gpu;
+                        r.device = c.device;
+                        r.ok     = llama_model_relocate_layer_experts(model_tgt, c.layer, c.to_gpu, c.device);
+                        if (!r.ok) {
+                            r.error = "relocation failed (see server log)";
+                        } else {
+                            any_applied = true;
+                        }
+                        SRV_INF("expert-placement: layer=%d -> %s (device %d): %s\n",
+                                c.layer, c.to_gpu ? "gpu" : "cpu", c.device, r.ok ? "ok" : "failed");
+                        res->changes.push_back(std::move(r));
+                    }
+                    // one re-reserve for the whole batch; next decode re-partitions the graph
+                    if (any_applied) {
+                        llama_context_request_reserve(ctx_tgt);
+                    }
+                    queue_results.send(std::move(res));
+                } break;
         }
     }
 
@@ -5412,21 +5457,93 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_expert_placement = [this](const server_http_req &) {
+        auto res = create_response();
+
+        const llama_model * model = ctx_server.model_tgt;
+        json layers = json::array();
+        if (model != nullptr) {
+            for (int il = 0; il < (int) model->layers.size(); ++il) {
+                const auto & L = model->layers[il];
+                ggml_backend_dev_t layer_dev = model->dev_layer(il);
+
+                json experts = json::object();
+                auto add = [&](const char * key, const ggml_tensor * t) {
+                    if (t != nullptr) {
+                        experts[key] = expert_backend_str(t, layer_dev);
+                    }
+                };
+                add("ffn_gate_exps",    L.ffn_gate_exps);
+                add("ffn_up_exps",      L.ffn_up_exps);
+                add("ffn_down_exps",    L.ffn_down_exps);
+                add("ffn_gate_up_exps", L.ffn_gate_up_exps);
+
+                if (experts.empty()) {
+                    continue; // dense (non-MoE) layer
+                }
+
+                // representative residency: the down projection (always present and unfused)
+                const ggml_tensor * rep = L.ffn_down_exps ? L.ffn_down_exps : L.ffn_gate_up_exps;
+                const bool on_gpu = std::string(expert_backend_str(rep, layer_dev)) == "gpu";
+
+                layers.push_back({
+                    { "layer",   il },
+                    { "on_gpu",  on_gpu },
+                    { "experts", std::move(experts) },
+                });
+            }
+        }
+
+        res->ok({
+            { "granularity", "layer" },
+            { "layers",      std::move(layers) },
+        });
+        return res;
+    };
+
     this->post_expert_placement = [this](const server_http_req & req) {
         auto res = create_response();
 
         json data = json::parse(req.body);
         const json changes = data.value("changes", json::array());
-
-        SRV_INF("expert-placement request: %s\n", changes.dump().c_str());
-        for (const auto & c : changes) {
-            const int layer = c.value("layer", -1);
-            const int device = c.value("device", 0);
-            const json experts_gpu = c.value("experts_gpu", json::array());
-            SRV_INF("  layer=%d device=%d experts_gpu=%s\n", layer, device, experts_gpu.dump().c_str());
+        if (!changes.is_array() || changes.empty()) {
+            res->error(format_error_response("\"changes\" must be a non-empty array", ERROR_TYPE_INVALID_REQUEST));
+            return res;
         }
 
-        res->ok({{ "success", true }, { "changes", changes }});
+        // milestone 1 is layer-granular: a change targets a whole layer's experts.
+        // to_gpu is inferred from a non-empty "experts_gpu" list or an explicit "backend".
+        server_task task(SERVER_TASK_TYPE_EXPERT_PLACEMENT);
+        task.id = res->rd.get_new_id();
+        for (const auto & c : changes) {
+            server_expert_placement_change ch;
+            ch.layer  = c.value("layer", -1);
+            ch.device = c.value("device", 0);
+            if (c.contains("backend")) {
+                ch.to_gpu = c.at("backend") == "gpu";
+            } else {
+                ch.to_gpu = !c.value("experts_gpu", json::array()).empty();
+            }
+            if (ch.layer < 0) {
+                res->error(format_error_response("each change requires a valid \"layer\"", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            task.expert_placement.push_back(ch);
+        }
+
+        res->rd.post_task(std::move(task));
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        res->ok(result->to_json());
         return res;
     };
 }

@@ -156,6 +156,7 @@ struct server_routes {
     server_http_context::handler_t get_moe_routed_experts;
     server_http_context::handler_t get_moe_routed_experts_for_completion;
 
+    server_http_context::handler_t get_expert_placement;
     server_http_context::handler_t post_expert_placement;
 
     // to be used in router mode

@@ -568,6 +568,16 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
 
+    // Runtime dynamic GPU placement of a layer's MoE experts (see docs/dynamic-gpu-load-v2.md).
+    // Moves the layer's packed expert tensors between their CPU home and the GPU device at dev_index.
+    // Requires the experts to be CPU-resident at load time. Returns false on failure.
+    // After a successful change, call llama_context_request_reserve() so the scheduler re-plans.
+    LLAMA_API bool llama_model_relocate_layer_experts(
+            struct llama_model * model,
+                        int32_t   il,
+                           bool   to_gpu,
+                        int32_t   dev_index);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
@@ -978,6 +988,10 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Request the backend scheduler to re-reserve on the next decode. Use after changing tensor
+    // placement at runtime (e.g. llama_model_relocate_layer_experts()) so ops are re-partitioned.
+    LLAMA_API void llama_context_request_reserve(struct llama_context * ctx);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

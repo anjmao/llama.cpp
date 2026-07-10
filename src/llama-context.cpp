@@ -3649,6 +3649,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
 
+void llama_context_request_reserve(llama_context * ctx) {
+    ctx->request_sched_reserve();
+}
+
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
 }
