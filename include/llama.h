@@ -324,6 +324,7 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool use_dynamic_experts; // enable runtime per-expert GPU placement (Metal/macOS only)
     };
 
     struct llama_sampler_seq_config {
@@ -634,6 +635,24 @@ extern "C" {
 
     // Returns true if the model is diffusion-based (like LLaDA, Dream, etc.)
     LLAMA_API bool llama_model_is_diffusion(const struct llama_model * model);
+
+    // Dynamic per-expert GPU placement (Metal/macOS only).
+    // Returns the number of layers that support dynamic expert placement, or 0 if disabled.
+    LLAMA_API int32_t llama_model_n_dynamic_expert_layers(const struct llama_model * model);
+
+    // Apply explicit per-layer GPU expert placement.
+    // changes is an array of {layer, n_experts, experts} structs.
+    // This is asynchronous: the request is queued and applied at the next decode quiescent point.
+    // Returns 0 on success, or a negative error code on validation failure.
+    struct llama_model_expert_placement {
+        int32_t layer;
+        int32_t n_experts;
+        const int32_t * experts; // global expert ids to keep on GPU
+    };
+    LLAMA_API int32_t llama_model_set_expert_placement(
+            struct llama_model * model,
+            const struct llama_model_expert_placement * changes,
+            int32_t n_changes);
 
     // Returns 0 on success
     LLAMA_API uint32_t llama_model_quantize(

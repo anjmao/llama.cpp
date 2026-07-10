@@ -633,6 +633,23 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // Dynamic per-expert placement (Metal/macOS only).
+    // Returns true if this model has dynamic expert placement enabled and the
+    // given layer has a partition state (i.e. it is an MoE layer).
+    bool has_dynamic_experts(int il = -1) const;
+
+    // Number of layers with dynamic expert placement state.
+    int32_t n_dynamic_expert_layers() const;
+
+    // Apply explicit per-layer GPU expert placement. Returns 0 on success.
+    int32_t set_expert_placement(
+            const struct llama_model_expert_placement * changes,
+            int32_t n_changes);
+
+    // Get the dynamic expert partition state for a layer. Returns nullptr if
+    // dynamic experts are not enabled or the layer is not an MoE layer.
+    const struct llama_expert_partition_state * get_expert_partition(int il) const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
@@ -729,6 +746,55 @@ const char * llm_type_name(llm_type type);
     const int64_t n_expert       = hparams.n_expert;         GGML_UNUSED(n_expert); \
     const int64_t n_expert_used  = hparams.n_expert_used;    GGML_UNUSED(n_expert_used); \
     const int64_t n_ctx_train    = hparams.n_ctx_train;      GGML_UNUSED(n_ctx_train);
+
+// Dynamic per-expert GPU placement state (Metal/macOS only)
+// Each MoE layer has three packed projection tensors (gate, up, down). Under
+// use_dynamic_experts the model keeps the original mmap'd CPU tensors as the
+// master copy and creates GPU-resident packed partitions of hot experts.
+struct llama_expert_partition_state {
+    int32_t n_expert = 0;                 // total experts in this layer
+    int32_t n_gpu    = 0;                 // experts currently resident on GPU
+    int32_t n_gpu_max = 0;                // max experts that fit in allocated slot pool
+
+    // global expert id -> GPU slot index, or -1 if CPU-resident
+    std::vector<int32_t> gpu_slot_of_expert;
+    // GPU slot index -> global expert id
+    std::vector<int32_t> expert_of_gpu_slot;
+
+    // device-resident remap tensor [n_expert], I32:
+    //   >=0 -> GPU slot index, -1 -> CPU-resident
+    // Updated at quiescent points; the graph reads this each decode.
+    ggml_tensor * remap = nullptr;
+
+    // GPU-resident packed partitions (views into the slot pool buffer)
+    // These are created with the same shape as the original expert tensors
+    // but with ne[2] = n_gpu_max.
+    ggml_tensor * ffn_gate_exps_gpu = nullptr;
+    ggml_tensor * ffn_up_exps_gpu   = nullptr;
+    ggml_tensor * ffn_down_exps_gpu = nullptr;
+
+    // CPU master copies (mmap'd, kept for the model lifetime)
+    ggml_tensor * ffn_gate_exps_cpu = nullptr;
+    ggml_tensor * ffn_up_exps_cpu   = nullptr;
+    ggml_tensor * ffn_down_exps_cpu = nullptr;
+};
+
+// A pool of expert-sized slots backed by a single GPU buffer.
+// One pool per (device, layer) in the simplest layout; layers are homogeneous
+// so slots are interchangeable within a layer.
+struct llama_expert_slot_pool {
+    ggml_backend_dev_t dev = nullptr;
+    ggml_backend_buffer_ptr buffer;
+    size_t slot_bytes = 0;                // bytes for gate+up+down of one expert
+    size_t n_slots    = 0;
+    std::vector<int32_t> free_slots;      // indices of free slots (LIFO)
+    std::vector<bool> used;               // slot usage bitmap
+
+    bool init(ggml_backend_dev_t dev, size_t slot_bytes, size_t n_slots, ggml_context * ctx);
+    int32_t checkout();
+    void checkin(int32_t slot);
+    size_t total_bytes() const { return slot_bytes * n_slots; }
+};
 
 // For internal test use
 // TODO: remove

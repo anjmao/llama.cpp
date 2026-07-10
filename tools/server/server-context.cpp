@@ -5411,6 +5411,100 @@ void server_routes::init_routes() {
 
         return res;
     };
+
+    this->get_expert_placement = [this](const server_http_req & req) {
+        GGML_UNUSED(req);
+
+        auto res = std::make_unique<server_http_res>();
+
+        llama_model * model = ctx_server.model_tgt;
+        if (model == nullptr) {
+            res->status = 503;
+            res->data = safe_json_to_str({{"error", format_error_response("Model not loaded", ERROR_TYPE_SERVER)}});
+            return res;
+        }
+
+        const int32_t n_layers = llama_model_n_dynamic_expert_layers(model);
+        json layers = json::array();
+        for (int32_t il = 0; il < n_layers; ++il) {
+            json layer_info;
+            layer_info["layer"] = il;
+            layer_info["n_expert"] = 0;
+            layer_info["n_gpu"] = 0;
+            layer_info["gpu_experts"] = json::array();
+            layers.push_back(layer_info);
+        }
+
+        json result;
+        result["use_dynamic_experts"] = n_layers > 0;
+        result["n_layers"] = n_layers;
+        result["layers"] = layers;
+
+        res->data = safe_json_to_str(result);
+        return res;
+    };
+
+    this->post_expert_placement = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+
+        llama_model * model = ctx_server.model_tgt;
+        if (model == nullptr) {
+            res->status = 503;
+            res->data = safe_json_to_str({{"error", format_error_response("Model not loaded", ERROR_TYPE_SERVER)}});
+            return res;
+        }
+
+        if (llama_model_n_dynamic_expert_layers(model) == 0) {
+            res->status = 400;
+            res->data = safe_json_to_str({{"error", format_error_response("Dynamic expert placement is not enabled for this model", ERROR_TYPE_INVALID_REQUEST)}});
+            return res;
+        }
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception & e) {
+            res->status = 400;
+            res->data = safe_json_to_str({{"error", format_error_response("Invalid JSON", ERROR_TYPE_INVALID_REQUEST)}});
+            return res;
+        }
+
+        if (!body.contains("changes") || !body["changes"].is_array()) {
+            res->status = 400;
+            res->data = safe_json_to_str({{"error", format_error_response("Missing 'changes' array", ERROR_TYPE_INVALID_REQUEST)}});
+            return res;
+        }
+
+        std::vector<llama_model_expert_placement> changes;
+        std::vector<std::vector<int32_t>> expert_buffers;
+        try {
+            for (const auto & ch : body["changes"]) {
+                llama_model_expert_placement placement{};
+                placement.layer = ch.at("layer").get<int32_t>();
+                expert_buffers.emplace_back(ch.at("experts").get<std::vector<int32_t>>());
+                placement.experts = expert_buffers.back().data();
+                placement.n_experts = (int32_t)expert_buffers.back().size();
+                changes.push_back(placement);
+            }
+        } catch (const std::exception & e) {
+            res->status = 400;
+            res->data = safe_json_to_str({{"error", format_error_response("Invalid placement request", ERROR_TYPE_INVALID_REQUEST)}});
+            return res;
+        }
+
+        int32_t ret = llama_model_set_expert_placement(model, changes.data(), (int32_t)changes.size());
+        if (ret != 0) {
+            res->status = 400;
+            res->data = safe_json_to_str({{"error", format_error_response(string_format("llama_model_set_expert_placement failed: %d", ret), ERROR_TYPE_INVALID_REQUEST)}});
+            return res;
+        }
+
+        json result;
+        result["success"] = true;
+        result["applied"] = changes.size();
+        res->data = safe_json_to_str(result);
+        return res;
+    };
 }
 
 json server_routes::get_model_info() const {

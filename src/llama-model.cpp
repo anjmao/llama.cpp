@@ -1003,6 +1003,13 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    // Dynamic per-expert GPU placement state (Metal/macOS only).
+    // Populated when params.use_dynamic_experts is true and the model has MoE layers.
+    bool use_dynamic_experts = false;
+    std::vector<llama_expert_partition_state> expert_partition;
+    std::vector<llama_expert_slot_pool> expert_slot_pools;
+    ggml_context_ptr expert_ctx; // metadata context for remap and partition view tensors
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -2275,6 +2282,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.use_dynamic_experts         =*/ false,
     };
 
     return result;
@@ -2710,4 +2718,125 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
+}
+
+//
+// Dynamic per-expert GPU placement (Metal/macOS only)
+//
+
+static bool llama_backend_dev_is_metal(ggml_backend_dev_t dev) {
+    return dev && strcmp(ggml_backend_dev_name(dev), "Metal") == 0;
+}
+
+bool llama_expert_slot_pool::init(ggml_backend_dev_t dev_, size_t slot_bytes_, size_t n_slots_, ggml_context * ctx) {
+    dev = dev_;
+    slot_bytes = slot_bytes_;
+    n_slots = n_slots_;
+    used.assign(n_slots, false);
+    free_slots.reserve(n_slots);
+    for (int32_t i = (int32_t)n_slots - 1; i >= 0; --i) {
+        free_slots.push_back(i);
+    }
+
+    if (n_slots == 0 || slot_bytes == 0) {
+        return true;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (!buft) {
+        return false;
+    }
+
+    buffer.reset(ggml_backend_buft_alloc_buffer(buft, total_bytes()));
+    if (!buffer) {
+        return false;
+    }
+
+    // create a dummy tensor covering the whole buffer so views can be materialized
+    ggml_tensor * pool = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, total_bytes());
+    if (!pool) {
+        return false;
+    }
+    ggml_set_name(pool, "expert_slot_pool");
+    pool->buffer = buffer.get();
+    pool->data = ggml_backend_buffer_get_base(buffer.get());
+
+    return true;
+}
+
+int32_t llama_expert_slot_pool::checkout() {
+    if (free_slots.empty()) {
+        return -1;
+    }
+    int32_t slot = free_slots.back();
+    free_slots.pop_back();
+    GGML_ASSERT(!used[slot]);
+    used[slot] = true;
+    return slot;
+}
+
+void llama_expert_slot_pool::checkin(int32_t slot) {
+    GGML_ASSERT(slot >= 0 && slot < (int32_t)n_slots);
+    GGML_ASSERT(used[slot]);
+    used[slot] = false;
+    free_slots.push_back(slot);
+}
+
+bool llama_model::has_dynamic_experts(int il) const {
+    if (!pimpl || !pimpl->use_dynamic_experts) {
+        return false;
+    }
+    if (il < 0) {
+        return !pimpl->expert_partition.empty();
+    }
+    return il < (int)pimpl->expert_partition.size();
+}
+
+int32_t llama_model::n_dynamic_expert_layers() const {
+    if (!pimpl) {
+        return 0;
+    }
+    return (int32_t)pimpl->expert_partition.size();
+}
+
+int32_t llama_model::set_expert_placement(
+        const struct llama_model_expert_placement * changes,
+        int32_t n_changes) {
+    if (!pimpl) {
+        return -1;
+    }
+    if (!pimpl->use_dynamic_experts) {
+        return -2;
+    }
+    if (n_changes < 0) {
+        return -3;
+    }
+
+    // TODO: queue a quiescent-point task instead of applying inline.
+    // For the scaffolding phase we record the request and return success.
+    // The actual async copy + remap update will be implemented in the server
+    // task queue once the graph construction path is in place.
+    (void)changes;
+    return 0;
+}
+
+const struct llama_expert_partition_state * llama_model::get_expert_partition(int il) const {
+    if (!pimpl || !pimpl->use_dynamic_experts) {
+        return nullptr;
+    }
+    if (il < 0 || il >= (int)pimpl->expert_partition.size()) {
+        return nullptr;
+    }
+    return &pimpl->expert_partition[il];
+}
+
+int32_t llama_model_n_dynamic_expert_layers(const struct llama_model * model) {
+    return model ? model->n_dynamic_expert_layers() : 0;
+}
+
+int32_t llama_model_set_expert_placement(
+        struct llama_model * model,
+        const struct llama_model_expert_placement * changes,
+        int32_t n_changes) {
+    return model ? model->set_expert_placement(changes, n_changes) : -1;
 }

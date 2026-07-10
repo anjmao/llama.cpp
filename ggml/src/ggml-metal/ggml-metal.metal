@@ -10407,10 +10407,20 @@ kernel void kernel_mul_mv_id(
     const int64_t i1 = idx;
     const int64_t i2 = i12;
 
+    device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);
+
+    // sentinel: negative IDs mean this branch does not contain the selected expert
+    // so the output for this token must be zero.
+    if (i02 < 0) {
+        device float * dst_f = (device float *) dst_cur;
+        for (int i = tiitg; i < args.ne0; i += args.nei0) {
+            dst_f[i] = 0.0f;
+        }
+        return;
+    }
+
     device const char * src0_cur = src0s + i02*args.nb02;
     device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
-
-    device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);
 
     ggml_metal_kargs_mul_mv args0 = {
         /*.ne00 =*/ args.ne00,
