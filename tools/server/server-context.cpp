@@ -5411,6 +5411,24 @@ void server_routes::init_routes() {
 
         return res;
     };
+
+    this->post_expert_placement = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        json data = json::parse(req.body);
+        const json changes = data.value("changes", json::array());
+
+        SRV_INF("expert-placement request: %s\n", changes.dump().c_str());
+        for (const auto & c : changes) {
+            const int layer = c.value("layer", -1);
+            const int device = c.value("device", 0);
+            const json experts_gpu = c.value("experts_gpu", json::array());
+            SRV_INF("  layer=%d device=%d experts_gpu=%s\n", layer, device, experts_gpu.dump().c_str());
+        }
+
+        res->ok({{ "success", true }, { "changes", changes }});
+        return res;
+    };
 }
 
 json server_routes::get_model_info() const {

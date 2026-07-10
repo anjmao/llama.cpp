@@ -236,6 +236,7 @@ int llama_server(int argc, char ** argv) {
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     ctx_http.get ("/v1/moe/routed-experts",             ex_wrapper(routes.get_moe_routed_experts));
     ctx_http.get ("/v1/moe/routed-experts/completion", ex_wrapper(routes.get_moe_routed_experts_for_completion));
+    ctx_http.post("/v1/model/expert-placement",        ex_wrapper(routes.post_expert_placement));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
