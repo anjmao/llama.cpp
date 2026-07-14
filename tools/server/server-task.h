@@ -30,11 +30,14 @@ enum server_task_type {
     SERVER_TASK_TYPE_EXPERT_PLACEMENT,
 };
 
-// SERVER_TASK_TYPE_EXPERT_PLACEMENT: one requested per-layer expert relocation
+// SERVER_TASK_TYPE_EXPERT_PLACEMENT: one requested placement change for a layer.
+// experts non-empty -> per-expert dynamic placement of exactly those ids on GPU;
+// experts empty      -> whole-layer move (to_gpu selects GPU or CPU).
 struct server_expert_placement_change {
-    int  layer  = -1;
-    bool to_gpu = false;
-    int  device = 0;
+    int                  layer  = -1;
+    bool                 to_gpu = false;
+    int                  device = 0;
+    std::vector<int32_t> experts;
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -596,11 +599,12 @@ struct server_task_result_apply_lora : server_task_result {
 
 struct server_task_result_expert_placement : server_task_result {
     struct change_result {
-        int         layer  = -1;
-        bool        to_gpu = false;
-        int         device = 0;
-        bool        ok     = false;
-        std::string error;
+        int                  layer  = -1;
+        bool                 to_gpu = false;
+        int                  device = 0;
+        bool                 ok     = false;
+        std::vector<int32_t> experts; // per-expert ids (empty for whole-layer)
+        std::string          error;
     };
     std::vector<change_result> changes;
 

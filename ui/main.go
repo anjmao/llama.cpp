@@ -82,6 +82,7 @@ func main() {
 	})
 	mux.HandleFunc("/v1/moe/routed-experts", handleProxy)
 	mux.HandleFunc("/v1/chat/completions", handleProxy)
+	mux.HandleFunc("/v1/model/expert-placement", handleAPIProxy)
 	mux.HandleFunc("/v1/moe/save-session", handleSaveSession)
 	mux.HandleFunc("/v1/moe/sessions", handleListSessions)
 	mux.HandleFunc("/v1/moe/sessions/", handleGetSession)
@@ -214,6 +215,51 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		flusher.Flush()
 	}
+}
+
+// handleAPIProxy forwards a request to the backend and passes the response through
+// faithfully (method, status, content-type). Unlike handleProxy it does not force SSE,
+// so it suits JSON endpoints like /v1/model/expert-placement (GET and POST).
+func handleAPIProxy(w http.ResponseWriter, r *http.Request) {
+	backend, err := url.Parse(*backendURL)
+	if err != nil {
+		http.Error(w, "invalid backend URL", http.StatusInternalServerError)
+		return
+	}
+
+	target := backend.String() + r.URL.Path
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for k, vv := range r.Header {
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		if k == "Content-Length" {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func handleSaveSession(w http.ResponseWriter, r *http.Request) {

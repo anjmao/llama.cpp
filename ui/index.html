@@ -12,6 +12,7 @@
       gap: 1px;
     }
     .expert-cell {
+      position: relative;
       aspect-ratio: 1;
       min-width: 18px;
       min-height: 18px;
@@ -30,6 +31,37 @@
     }
     .expert-cell.current {
       box-shadow: inset 0 0 0 1px #1d4ed8;
+    }
+    /* per-expert GPU residency marker: a corner dot, independent of the blue count heatmap */
+    .expert-cell.on-gpu::after {
+      content: '';
+      position: absolute;
+      top: 1px;
+      right: 1px;
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: #059669;
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.9);
+    }
+    .gpu-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #059669;
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.9);
+      vertical-align: middle;
+    }
+    .expert-chip {
+      display: inline-block;
+      font-size: 9px;
+      padding: 1px 5px;
+      margin: 1px;
+      border-radius: 999px;
+      background: #d1fae5;
+      color: #065f46;
+      font-family: ui-monospace, monospace;
     }
     .layer-label {
       min-width: 48px;
@@ -123,7 +155,10 @@
       <div class="bg-white rounded-lg shadow p-4">
         <div class="flex items-center justify-between mb-3">
           <h2 class="text-lg font-semibold">Current position</h2>
-          <div class="text-xs text-gray-500">Experts selected up to current token</div>
+          <div class="text-xs text-gray-500 flex items-center gap-3">
+            <span>Experts selected up to current token</span>
+            <span class="flex items-center gap-1"><span class="gpu-dot"></span> on GPU</span>
+          </div>
         </div>
         <div id="currentGrid" class="overflow-x-auto">
           <template x-if="maxLayer < 0 || maxExpert < 0">
@@ -196,8 +231,18 @@
     </div>
 
     <div class="mt-4 bg-white rounded-lg shadow p-4">
-      <h2 class="text-lg font-semibold mb-2">Backend residency</h2>
-      <div class="text-xs text-gray-500 mb-2">Per-layer tensor placement reported by the server</div>
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-lg font-semibold">Expert placement</h2>
+        <div class="flex items-center gap-3">
+          <span class="text-xs text-gray-500 flex items-center gap-1"><span class="gpu-dot"></span> = expert resident on GPU</span>
+          <button @click="fetchPlacement" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">Refresh</button>
+        </div>
+      </div>
+      <div class="text-xs text-gray-500 mb-2">Per-expert GPU placement from <code class="bg-gray-100 px-1 rounded">/v1/model/expert-placement</code> (green dots on the grids above mark GPU-resident experts)</div>
+      <div id="placementSummary" x-html="placementSummaryHTML" class="mb-4"></div>
+
+      <h3 class="text-sm font-semibold text-gray-700 mb-1">Per-layer tensor residency</h3>
+      <div class="text-xs text-gray-500 mb-2">Coarse per-projection placement reported in the routing stream</div>
       <div id="backendLegend" x-html="backendLegendHTML"></div>
     </div>
 
@@ -279,6 +324,10 @@
         currentMaxCount: 1,
         currentSelected: {},
         backendLegendHTML: '',
+        placementByLayer: {},
+        placementLoaded: false,
+        placementTimer: null,
+        placementSummaryHTML: '',
 
         get statusClass() {
           if (this.statusText === 'Receiving events') return 'bg-green-100 text-green-800';
@@ -302,6 +351,43 @@
           this.$watch('currentTokenIndex', () => this.updateComputed());
           this.connect();
           this.scheduleRender();
+          this.fetchPlacement();
+          // per-expert placement can change out-of-band (via POST /v1/model/expert-placement),
+          // so poll it periodically to keep the GPU markers current
+          this.placementTimer = setInterval(() => this.fetchPlacement(), 3000);
+        },
+
+        async fetchPlacement() {
+          try {
+            const resp = await fetch('/v1/model/expert-placement');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const byLayer = {};
+            (data.layers || []).forEach(l => {
+              const gpuExperts = {};
+              (l.experts_gpu || []).forEach(e => { gpuExperts[e] = true; });
+              byLayer[l.layer] = {
+                dynamic: !!l.dynamic,
+                on_gpu: !!l.on_gpu,
+                gpuExperts: gpuExperts,
+                gpuCount: (l.experts_gpu || []).length,
+              };
+            });
+            this.placementByLayer = byLayer;
+            this.placementLoaded = true;
+            this.scheduleRender();
+          } catch (err) {
+            // backend may not support the endpoint; leave placement empty
+          }
+        },
+
+        // per-expert GPU residency: dynamic layers use the placed id set; a whole-layer
+        // relocation (on_gpu) marks every expert on that layer as GPU-resident.
+        isExpertOnGpu(layer, ex) {
+          const p = this.placementByLayer[layer];
+          if (!p) return false;
+          if (p.dynamic) return !!p.gpuExperts[ex];
+          return p.on_gpu;
         },
 
         generateSessionId() {
@@ -455,6 +541,38 @@
           this.currentMaxCount = Math.max(1, ...Object.values(this.currentCounts));
 
           this.backendLegendHTML = this.buildBackendLegendHTML();
+          this.placementSummaryHTML = this.buildPlacementSummaryHTML();
+        },
+
+        buildPlacementSummaryHTML() {
+          const layers = Object.keys(this.placementByLayer).map(Number).sort((a, b) => a - b);
+          if (layers.length === 0) {
+            return '<span class="text-sm text-gray-400">No placement data yet</span>';
+          }
+          const total = this.expertTotal();
+          let html = '<div class="flex flex-col gap-1">';
+          let any = false;
+          layers.forEach(layer => {
+            const p = this.placementByLayer[layer];
+            const onGpu = p.dynamic ? p.gpuCount > 0 : p.on_gpu;
+            if (!onGpu) return;
+            any = true;
+            html += '<div class="flex items-start gap-2 text-xs py-0.5">';
+            html += `<span class="font-medium" style="min-width:36px;">L${layer}</span>`;
+            if (p.dynamic) {
+              const ids = Object.keys(p.gpuExperts).map(Number).sort((a, b) => a - b);
+              html += `<span class="text-gray-500" style="min-width:78px;">${p.gpuCount}/${total || '?'} on GPU</span>`;
+              html += '<span class="flex-1">' + ids.map(id => `<span class="expert-chip">${id}</span>`).join('') + '</span>';
+            } else {
+              html += '<span class="backend-badge backend-gpu">whole layer on GPU</span>';
+            }
+            html += '</div>';
+          });
+          if (!any) {
+            html += '<span class="text-sm text-gray-400">All experts on CPU</span>';
+          }
+          html += '</div>';
+          return html;
         },
 
         cumulativeCellCount(layer, ex) {
@@ -466,7 +584,9 @@
         },
 
         cumulativeCellClass(layer, ex) {
-          return this.cumulativeCellCount(layer, ex) > 0 ? 'selected' : 'bg-gray-100';
+          const classes = [this.cumulativeCellCount(layer, ex) > 0 ? 'selected' : 'bg-gray-100'];
+          if (this.isExpertOnGpu(layer, ex)) classes.push('on-gpu');
+          return classes.join(' ');
         },
 
         currentCellClass(layer, ex) {
@@ -477,6 +597,7 @@
           if (this.currentSelected[layer] && this.currentSelected[layer][ex]) {
             classes.push('current');
           }
+          if (this.isExpertOnGpu(layer, ex)) classes.push('on-gpu');
           return classes.join(' ');
         },
 
@@ -498,15 +619,30 @@
         },
 
         cellTitle(layer, ex, count) {
-          return `layer ${layer}, expert ${ex}${count ? ', count: ' + count : ''}`;
+          const place = this.isExpertOnGpu(layer, ex) ? 'GPU' : 'CPU';
+          return `layer ${layer}, expert ${ex} [${place}]${count ? ', count: ' + count : ''}`;
+        },
+
+        expertTotal() {
+          return this.maxExpert >= 0 ? this.maxExpert + 1 : 0;
         },
 
         backendBadgeClass(layer) {
+          const p = this.placementByLayer[layer];
+          if (p) {
+            if (p.dynamic) return p.gpuCount > 0 ? 'backend-gpu' : 'backend-cpu';
+            return p.on_gpu ? 'backend-gpu' : 'backend-cpu';
+          }
           const backend = this.backendByLayer[layer];
           return backend && backend.ffn_down_exps === 'gpu' ? 'backend-gpu' : 'backend-cpu';
         },
 
         backendBadgeText(layer) {
+          const p = this.placementByLayer[layer];
+          if (p) {
+            if (p.dynamic) return 'gpu ' + p.gpuCount + '/' + (this.expertTotal() || '?');
+            return p.on_gpu ? 'gpu' : 'cpu';
+          }
           const backend = this.backendByLayer[layer];
           return backend && backend.ffn_down_exps === 'gpu' ? 'gpu' : 'cpu';
         },

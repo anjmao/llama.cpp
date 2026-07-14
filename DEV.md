@@ -54,4 +54,12 @@ curl -s http://localhost:8080/v1/model/expert-placement \
   -d '{"changes":[{"layer":6,"backend":"gpu"}]}'
 ```
 
+Or specific expert
+
+```sh
+curl -s http://localhost:8080/v1/model/expert-placement \
+  -H 'Content-Type: application/json' \
+  -d '{"changes":[{"layer":1,"experts_gpu":[0,2]}]}'
+```
+
 In UI verify that layer was loaded to GPU

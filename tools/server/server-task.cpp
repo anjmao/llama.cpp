@@ -1608,6 +1608,10 @@ json server_task_result_expert_placement::to_json() {
             { "device",  c.device },
             { "ok",      c.ok },
         };
+        if (!c.experts.empty()) {
+            j["experts_gpu"]  = c.experts;
+            j["granularity"]  = "expert";
+        }
         if (!c.ok) {
             j["error"] = c.error;
         }

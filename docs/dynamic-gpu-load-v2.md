@@ -204,3 +204,136 @@ Explicit POST expresses **the full desired GPU set per layer** (declarative, not
 ## Conclusion
 
 Per-expert GPU placement cannot be expressed as tensor migration because GGUF packs all experts into one tensor per projection; it requires a dual-partition representation and a split MUL_MAT_ID execution path with a device-resident remap table. Everything else — mmap master copy, slot pooling, async copy with quiescent-point commit, batched declarative API — carries over from the tensor-granular proposal unchanged. Because the graph topology is static and only remap contents change, interval rebalancing costs background PCIe copies plus a microsecond metadata swap, with **zero scheduler re-reserves** in steady state. The design is gated on Phase 0 measurement: windowed expert-coverage and CPU/GPU matvec deltas on target hardware determine whether the mechanism pays for itself before any kernel work begins.
+
+---
+
+## Implementation Notes: Per-Expert Placement on Unified Memory (Metal)
+
+This section documents the concrete design actually implemented in this fork. It targets
+Apple Silicon / Metal (unified memory), builds on the per-layer buffer-swap mechanism already
+shipped (below), and deliberately trades peak performance for a correct, kernel-change-free
+bring-up that runs today.
+
+### What already exists (per-layer, milestone 1)
+
+`POST /v1/model/expert-placement` with `{"changes":[{"layer":N,"backend":"gpu|cpu"}]}` relocates
+a whole layer's packed expert tensors (`ffn_{gate,up,down}_exps`, fused `ffn_gate_up_exps`)
+between their CPU home and a GPU device at a decode-loop quiescent point, then requests one
+scheduler re-reserve. Mechanism: keep the `ggml_tensor`, swap its `buffer`/`data` to a cached
+Metal buffer (weights copied in) or restore the load-time CPU backing; update `dev_layer[il]`
+so residency reporting and the scheduler's layer-affinity agree. `GET /v1/model/expert-placement`
+reports per-layer residency authoritatively. This section extends that to per-*expert* control.
+
+### The core constraint
+
+`GGML_OP_MUL_MAT_ID` runs one packed expert tensor on one backend and asserts every routed id is
+in range `[0, n_expert)` — there is **no sentinel/skip**. So "expert 3 on GPU, expert 4 on CPU"
+within one layer cannot be a single fused matmul; it requires two `MUL_MAT_ID` executions over two
+backend-resident weight tensors whose partial outputs are combined. This is the split-execution
+path from the proposal above; here we implement its **masking bring-up (option b)** rather than
+sentinel-skip kernels (option a), because option (a) needs a Metal kernel change and option (b)
+needs none.
+
+### Why unified memory changes the cost model (and the value proposition)
+
+On a discrete GPU the point of per-expert placement is to fit only the *hot* experts in scarce
+VRAM and pay PCIe once per rebalance. On Apple Silicon, "VRAM" is the same physical RAM as the
+CPU sees; there is no separate budget to economise, and moving an expert to the Metal backend is
+a shared-buffer `memcpy` (or a zero-copy view), not a PCIe transfer. Consequently:
+
+- Per-expert placement here is a **control/observation mechanism** (drive an external residency
+  predictor, measure routing skew, attribute expert compute to a backend), **not** a decode
+  speedup. In fact the masking bring-up *doubles* per-expert matmul work at decode (see below),
+  so on unified memory it is expected to be neutral-to-slower on throughput. This is an explicit,
+  accepted trade for correctness and zero kernel churn.
+- Because there is no VRAM budget to respect, the GPU-side weight copy can be **full-size**
+  (all `n_expert` slots), which removes the need for a compaction/remap table entirely and makes
+  the graph much simpler. Compaction + remap + sentinel-skip remain the right optimization for a
+  future CUDA path (and to remove the doubling); they are documented as future work, not built.
+
+### Chosen mechanism: dual-branch masked execution
+
+For a layer with an active per-expert placement, keep the original packed expert tensors on their
+CPU home (mmap master, unchanged) **and** hold a second, full-size copy of the same tensors in a
+Metal buffer. Both copies contain every expert's real weights; they differ only in which backend
+owns them. Which experts are "on GPU" is expressed by a per-expert **mask**, not by which weights
+live where:
+
+```
+selected_experts = top_k(router_logits)          # [n_expert_used, n_tokens], global ids
+weights          = normalized router weights      # [1, n_expert_used, n_tokens]
+
+# per-selected-expert masks gathered from device-resident f32[n_expert] tables
+m_gpu = get_rows(expert_gpu_mask, selected_experts)   # 1.0 if expert placed on GPU else 0.0
+m_cpu = get_rows(expert_cpu_mask, selected_experts)   # 1.0 - m_gpu
+
+experts_gpu = moe_sub_ffn(gpu_copy_{gate,up,down}, x, selected_experts)  # runs on Metal
+experts_cpu = moe_sub_ffn(cpu_{gate,up,down},      x, selected_experts)  # runs on CPU
+
+out = sum_experts( experts_gpu * (weights * m_gpu)
+                 + experts_cpu * (weights * m_cpu) )
+```
+
+`moe_sub_ffn` is the existing gate/up -> activation -> down chain, factored into a helper and
+invoked once per branch. Both branches use the same `selected_experts` (valid for both, since
+both copies are full-size) — **no remap gather, no local slot indices**. The scheduler places the
+GPU branch on Metal (its weights live in a Metal buffer) and the CPU branch on CPU (mmap), exactly
+as static `-ot exps=CPU` placement does today; the final `add` forces one cross-backend copy of a
+small activation. Graph topology is fixed once a layer is activated; changing the GPU expert set
+is a metadata update to the two mask tables (`ggml_backend_tensor_set`, `n_expert x 4` bytes)
+plus a re-reserve.
+
+### Why this is correct
+
+- Every routed id is in range for both branches (both are full `n_expert`), so no assert fires.
+- Non-selected-side contributions are multiplied by a mask of exactly `0.0`. To avoid `0 * NaN`
+  from uninitialised quant bytes, the Metal copy is initialised with the **complete** original
+  tensor (all experts, real weights), never left partially filled. So both branches produce
+  finite values and the mask cleanly selects one side per expert.
+- `m_gpu + m_cpu == 1` for every expert, so each selected expert contributes exactly once with
+  its correct router weight; the summed output equals the single-branch result up to
+  backend floating-point differences (CPU vs Metal matmul are not bit-identical, but greedy
+  decoding stays coherent and matches in practice on small models).
+
+### Trade-offs (stated plainly)
+
+- **Compute doubling at decode.** Each selected expert's gate/up/down matmuls run on *both*
+  backends (one masked away). At batch=1 the expert matmul is bandwidth-bound, so this roughly
+  doubles expert-weight bandwidth. Acceptable for a control mechanism; removed later by
+  sentinel-skip (option a) which lets each branch process only its own experts.
+- **Full-size GPU copy.** A layer with any GPU-placed expert holds a complete copy of its expert
+  tensors in a Metal buffer (~the layer's expert footprint). Fine on unified memory for a handful
+  of layers; the compact-partition (K slots + remap) variant is the memory-frugal form for CUDA.
+- **Layout.** Copying expert slices requires the standard GGUF layout; repacked (`CPU_REPACK`) /
+  AMX CPU buffers are rejected (load with `-nr`/`--no-repack`), same guard as milestone 1.
+
+### Runtime data & control flow
+
+- `llama_layer` gains, populated only when a per-expert placement is active: full-size Metal
+  copies `ffn_{gate,up,down,gate_up}_exps_gpu`, and two f32 `[n_expert]` mask tensors
+  (`expert_gpu_mask`, `expert_cpu_mask`). These are persistent, graph-referenced tensors created
+  in a per-layer `ggml_context` + Metal buffer owned by the model.
+- `llama_model::set_expert_placement(il, gpu_expert_ids, dev)` (new): lazily creates the Metal
+  copies (full-copy from the CPU master), writes the two mask tables from the requested id set,
+  and marks the layer active. Re-issuing with a new id set just rewrites the masks. An empty set
+  deactivates the layer (falls back to the plain single-branch CPU path). Runs on the decode
+  thread via the existing `EXPERT_PLACEMENT` server task, followed by one re-reserve.
+- `build_moe_ffn` takes one new trailing parameter (`const llama_layer *`, default null); when the
+  layer is active it builds the dual branch, otherwise the existing single path. Only the arch
+  builders wired for this feature pass the layer (initially `llama` and `olmoe`); all other call
+  sites keep the default and are unchanged.
+
+### API
+
+- `POST /v1/model/expert-placement` — `experts_gpu` is now honoured **per expert**:
+  `{"changes":[{"layer":20,"experts_gpu":[3,17,41],"device":0}]}` places exactly experts 3/17/41
+  of layer 20 on GPU and the rest on CPU. An empty/absent list deactivates dynamic mode for the
+  layer. `backend:"gpu"` (no list) means all experts of the layer.
+- `GET /v1/model/expert-placement` — reports, per layer, whether dynamic mode is active and the
+  set of GPU-placed expert ids (in addition to the coarse per-projection residency).
+
+### Explicitly deferred
+
+Sentinel-skip `MUL_MAT_ID` kernels (removes the compute doubling), compact GPU partition + remap
+(memory-frugal, needed for CUDA), the auto-rebalancer (counters/EWMA/hysteresis, `/policy` +
+`/stats`), per-expert bias/scale (`_exps_b`/`_exps_s`) support, and non-`llama`/`olmoe` arches.

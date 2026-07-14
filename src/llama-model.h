@@ -311,6 +311,18 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
 
+    // dynamic per-expert GPU placement (see docs/dynamic-gpu-load-v2.md).
+    // populated only while dynamic_experts is true: full-size GPU copies of the packed
+    // expert tensors plus f32[n_expert] masks selecting which experts the GPU branch owns.
+    struct ggml_tensor * ffn_gate_exps_gpu    = nullptr;
+    struct ggml_tensor * ffn_up_exps_gpu      = nullptr;
+    struct ggml_tensor * ffn_down_exps_gpu    = nullptr;
+    struct ggml_tensor * ffn_gate_up_exps_gpu = nullptr;
+    struct ggml_tensor * expert_gpu_mask      = nullptr; // 1.0 for GPU-placed experts, else 0.0
+    struct ggml_tensor * expert_cpu_mask      = nullptr; // 1.0 - expert_gpu_mask
+    bool                 dynamic_experts      = false;
+    std::vector<int32_t> dynamic_expert_ids;             // expert ids currently placed on GPU (reporting)
+
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;
@@ -635,6 +647,11 @@ struct llama_model {
     // to_gpu=false restores the load-time CPU backing. Requires the experts to be CPU-resident at
     // load time. Returns false and sets err on failure; a no-op (already on target) returns true.
     bool relocate_layer_experts(int il, bool to_gpu, int dev_index, std::string & err);
+
+    // dynamic per-expert placement: place exactly the given expert ids of layer il on the GPU
+    // device (rest on CPU) via the dual-branch masked path. An empty id set deactivates dynamic
+    // mode for the layer. Returns false and sets err on failure.
+    bool set_expert_placement(int il, const std::vector<int32_t> & gpu_expert_ids, int dev_index, std::string & err);
 
     bool has_tensor_overrides() const;
 

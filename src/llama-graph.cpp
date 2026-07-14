@@ -1469,7 +1469,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+   const llama_layer * dyn_layer) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1489,7 +1490,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         /* gate_up_exps_b */ nullptr,
         up_exps_s,
         gate_exps_s,
-        down_exps_s
+        down_exps_s,
+        dyn_layer
     );
 }
 
@@ -1516,7 +1518,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * gate_up_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * down_exps_s,
+   const llama_layer * dyn_layer) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1655,6 +1658,49 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // dynamic per-expert placement: compute the GPU-resident branch over a full-size Metal copy
+    // using the same routed ids; its non-placed experts are masked out at the weighted sum below.
+    // see docs/dynamic-gpu-load-v2.md (Per-Expert Placement on Unified Memory).
+    const bool dyn_experts = dyn_layer != nullptr && dyn_layer->dynamic_experts && !weight_before_ffn;
+    ggml_tensor * experts_gpu = nullptr;
+    if (dyn_experts) {
+        ggml_tensor * g_gate = nullptr;
+        ggml_tensor * g_up   = nullptr;
+        if (dyn_layer->ffn_gate_up_exps_gpu) {
+            ggml_tensor * gate_up = build_lora_mm_id(dyn_layer->ffn_gate_up_exps_gpu, cur, selected_experts, nullptr);
+            const int64_t n_ff = gate_up->ne[0] / 2;
+            g_gate = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+            g_up   = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
+        } else {
+            g_up = build_lora_mm_id(dyn_layer->ffn_up_exps_gpu, cur, selected_experts, nullptr);
+            g_gate = dyn_layer->ffn_gate_exps_gpu
+                ? build_lora_mm_id(dyn_layer->ffn_gate_exps_gpu, cur, selected_experts, nullptr)
+                : g_up;
+        }
+        const bool has_gate_g = dyn_layer->ffn_gate_exps_gpu || dyn_layer->ffn_gate_up_exps_gpu;
+        switch (type_op) {
+            case LLM_FFN_SILU:
+                g_gate = has_gate_g ? ggml_swiglu_split(ctx0, g_gate, g_up) : ggml_silu(ctx0, g_gate);
+                break;
+            case LLM_FFN_GELU:
+                g_gate = has_gate_g ? ggml_geglu_split(ctx0, g_gate, g_up) : ggml_gelu(ctx0, g_gate);
+                break;
+            case LLM_FFN_SWIGLU_OAI_MOE:
+                g_gate = ggml_swiglu_oai(ctx0, g_gate, g_up, 1.702f, 7.0f);
+                break;
+            case LLM_FFN_RELU:
+                g_gate = has_gate_g ? ggml_reglu_split(ctx0, g_gate, g_up) : ggml_relu(ctx0, g_gate);
+                break;
+            case LLM_FFN_RELU_SQR:
+                g_gate = ggml_sqr(ctx0, ggml_relu(ctx0, g_gate));
+                break;
+            default:
+                GGML_ABORT("fatal error");
+        }
+        experts_gpu = build_lora_mm_id(dyn_layer->ffn_down_exps_gpu, g_gate, selected_experts, nullptr);
+        cb(experts_gpu, "ffn_moe_down_gpu", il);
+    }
+
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
@@ -1789,7 +1835,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    if (!weight_before_ffn) {
+    if (dyn_experts) {
+        // combine GPU and CPU branches: each selected expert contributes from exactly one side.
+        // masks are per global expert; broadcast across tokens then gather per selected expert.
+        ggml_tensor * gpu_bc = ggml_repeat(ctx0, ggml_reshape_3d(ctx0, dyn_layer->expert_gpu_mask, 1, n_expert, 1), probs);
+        ggml_tensor * cpu_bc = ggml_repeat(ctx0, ggml_reshape_3d(ctx0, dyn_layer->expert_cpu_mask, 1, n_expert, 1), probs);
+        ggml_tensor * m_gpu  = ggml_get_rows(ctx0, gpu_bc, selected_experts); // [1, n_expert_used, n_tokens]
+        ggml_tensor * m_cpu  = ggml_get_rows(ctx0, cpu_bc, selected_experts);
+
+        ggml_tensor * w_gpu = ggml_mul(ctx0, weights, m_gpu);
+        ggml_tensor * w_cpu = ggml_mul(ctx0, weights, m_cpu);
+
+        experts = ggml_add(ctx0,
+                ggml_mul(ctx0, experts_gpu, w_gpu),
+                ggml_mul(ctx0, experts,     w_cpu));
+        cb(experts, "ffn_moe_weighted", il);
+    } else if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }

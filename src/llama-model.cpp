@@ -1015,6 +1015,14 @@ struct llama_model::impl {
         bool                    on_gpu      = false;
     };
     std::unordered_map<ggml_tensor *, expert_reloc_slot> expert_reloc;
+
+    // dynamic per-expert placement: per-layer owned context + GPU buffer holding the full-size
+    // expert copies and the two mask tensors referenced by the split-execution graph.
+    struct expert_dyn_ctx {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+    };
+    std::unordered_map<int, expert_dyn_ctx> expert_dyn;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -2107,6 +2115,130 @@ bool llama_model::relocate_layer_experts(int il, bool to_gpu, int dev_index, std
         pimpl->dev_layer[il].dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     }
 
+    return true;
+}
+
+bool llama_model::set_expert_placement(int il, const std::vector<int32_t> & gpu_expert_ids, int dev_index, std::string & err) {
+    if (il < 0 || il >= (int) layers.size()) {
+        err = "layer " + std::to_string(il) + " out of range";
+        return false;
+    }
+    llama_layer & L = layers[il];
+
+    // empty set -> deactivate dynamic mode for this layer (fall back to plain CPU path)
+    if (gpu_expert_ids.empty()) {
+        L.dynamic_experts      = false;
+        L.ffn_gate_exps_gpu    = nullptr;
+        L.ffn_up_exps_gpu      = nullptr;
+        L.ffn_down_exps_gpu    = nullptr;
+        L.ffn_gate_up_exps_gpu = nullptr;
+        L.expert_gpu_mask      = nullptr;
+        L.expert_cpu_mask      = nullptr;
+        L.dynamic_expert_ids.clear();
+        pimpl->expert_dyn.erase(il);
+        return true;
+    }
+
+    const int64_t n_expert = hparams.n_expert;
+    if (n_expert <= 0) {
+        err = "layer " + std::to_string(il) + " is not MoE";
+        return false;
+    }
+
+    struct src_pair { ggml_tensor * src; ggml_tensor ** dst; };
+    std::vector<src_pair> pairs;
+    auto consider = [&](ggml_tensor * src, ggml_tensor ** dst) { if (src) { pairs.push_back({src, dst}); } };
+    consider(L.ffn_gate_exps,    &L.ffn_gate_exps_gpu);
+    consider(L.ffn_up_exps,      &L.ffn_up_exps_gpu);
+    consider(L.ffn_down_exps,    &L.ffn_down_exps_gpu);
+    consider(L.ffn_gate_up_exps, &L.ffn_gate_up_exps_gpu);
+    if (pairs.empty()) {
+        err = "layer " + std::to_string(il) + " has no MoE expert tensors";
+        return false;
+    }
+
+    if (L.ffn_gate_exps_b || L.ffn_up_exps_b || L.ffn_down_exps_b || L.ffn_gate_up_exps_b ||
+        L.ffn_gate_exps_s || L.ffn_up_exps_s || L.ffn_down_exps_s) {
+        err = "per-expert placement is not supported for experts with bias/scale tensors";
+        return false;
+    }
+
+    for (auto & p : pairs) {
+        if (!buft_is_cpu(p.src->buffer)) {
+            err = "layer " + std::to_string(il) + " experts must be CPU-resident to set per-expert placement";
+            return false;
+        }
+        const char * name = p.src->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(p.src->buffer)) : nullptr;
+        if (name != nullptr && (strstr(name, "REPACK") != nullptr || strstr(name, "AMX") != nullptr)) {
+            err = std::string("layer ") + std::to_string(il) + " experts use a repacked CPU layout (" +
+                  name + "); load with -nr/--no-repack";
+            return false;
+        }
+    }
+
+    if (dev_index < 0 || dev_index >= (int) devices.size()) {
+        err = "invalid GPU device index " + std::to_string(dev_index);
+        return false;
+    }
+    ggml_backend_buffer_type_t gpu_buft = ggml_backend_dev_buffer_type(devices[dev_index].dev);
+
+    // (re)create the per-layer context holding the full-size GPU copies + masks
+    pimpl->expert_dyn.erase(il);
+    llama_model::impl::expert_dyn_ctx holder;
+    {
+        ggml_init_params ip = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * (pairs.size() + 4),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        holder.ctx.reset(ggml_init(ip));
+        if (!holder.ctx) {
+            err = "failed to create dynamic-expert context";
+            return false;
+        }
+    }
+    ggml_context * ctx = holder.ctx.get();
+
+    for (auto & p : pairs) {
+        ggml_tensor * g = ggml_new_tensor(ctx, p.src->type, GGML_MAX_DIMS, p.src->ne);
+        ggml_set_name(g, (std::string(p.src->name) + ".gpu").c_str());
+        *p.dst = g;
+    }
+    ggml_tensor * mask_gpu = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+    ggml_tensor * mask_cpu = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+    ggml_set_name(mask_gpu, ("ffn_expert_gpu_mask-" + std::to_string(il)).c_str());
+    ggml_set_name(mask_cpu, ("ffn_expert_cpu_mask-" + std::to_string(il)).c_str());
+
+    holder.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, gpu_buft));
+    if (!holder.buf) {
+        for (auto & p : pairs) {
+            *p.dst = nullptr;
+        }
+        err = "failed to allocate GPU buffer for dynamic experts of layer " + std::to_string(il);
+        return false;
+    }
+
+    // full copy of every expert (real weights) so masked-out contributions are finite, not NaN
+    for (auto & p : pairs) {
+        ggml_backend_tensor_set(*p.dst, p.src->data, 0, ggml_nbytes(p.src));
+    }
+
+    std::vector<float> host_gpu(n_expert, 0.0f), host_cpu(n_expert, 1.0f);
+    for (int32_t e : gpu_expert_ids) {
+        if (e >= 0 && e < n_expert) {
+            host_gpu[e] = 1.0f;
+            host_cpu[e] = 0.0f;
+        }
+    }
+    ggml_backend_tensor_set(mask_gpu, host_gpu.data(), 0, host_gpu.size() * sizeof(float));
+    ggml_backend_tensor_set(mask_cpu, host_cpu.data(), 0, host_cpu.size() * sizeof(float));
+
+    L.expert_gpu_mask = mask_gpu;
+    L.expert_cpu_mask = mask_cpu;
+    L.dynamic_experts = true;
+    L.dynamic_expert_ids.assign(gpu_expert_ids.begin(), gpu_expert_ids.end());
+
+    pimpl->expert_dyn[il] = std::move(holder);
     return true;
 }
 

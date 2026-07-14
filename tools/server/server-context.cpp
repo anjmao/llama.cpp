@@ -2954,17 +2954,37 @@ private:
                     bool any_applied = false;
                     for (const auto & c : task.expert_placement) {
                         server_task_result_expert_placement::change_result r;
-                        r.layer  = c.layer;
-                        r.to_gpu = c.to_gpu;
-                        r.device = c.device;
-                        r.ok     = llama_model_relocate_layer_experts(model_tgt, c.layer, c.to_gpu, c.device);
-                        if (!r.ok) {
-                            r.error = "relocation failed (see server log)";
+                        r.layer   = c.layer;
+                        r.device  = c.device;
+                        r.experts = c.experts;
+                        r.to_gpu  = c.to_gpu || !c.experts.empty();
+                        std::string err;
+                        bool ok = true;
+                        const char * mode = nullptr;
+                        if (!c.experts.empty()) {
+                            // per-expert dynamic placement: restore originals to CPU, then set the subset
+                            model_tgt->relocate_layer_experts(c.layer, false, c.device, err);
+                            ok = model_tgt->set_expert_placement(c.layer, c.experts, c.device, err);
+                            mode = "gpu(subset)";
+                        } else if (c.to_gpu) {
+                            // whole layer to GPU via buffer swap; clear any dynamic mode first
+                            model_tgt->set_expert_placement(c.layer, {}, c.device, err);
+                            ok = model_tgt->relocate_layer_experts(c.layer, true, c.device, err);
+                            mode = "gpu(all)";
+                        } else {
+                            // whole layer back to CPU; clear any dynamic mode
+                            model_tgt->set_expert_placement(c.layer, {}, c.device, err);
+                            ok = model_tgt->relocate_layer_experts(c.layer, false, c.device, err);
+                            mode = "cpu";
+                        }
+                        r.ok = ok;
+                        if (!ok) {
+                            r.error = err;
                         } else {
                             any_applied = true;
                         }
-                        SRV_INF("expert-placement: layer=%d -> %s (device %d): %s\n",
-                                c.layer, c.to_gpu ? "gpu" : "cpu", c.device, r.ok ? "ok" : "failed");
+                        SRV_INF("expert-placement: layer=%d %s (device %d): %s\n",
+                                c.layer, mode, c.device, ok ? "ok" : err.c_str());
                         res->changes.push_back(std::move(r));
                     }
                     // one re-reserve for the whole batch; next decode re-partitions the graph
@@ -5486,11 +5506,16 @@ void server_routes::init_routes() {
                 const ggml_tensor * rep = L.ffn_down_exps ? L.ffn_down_exps : L.ffn_gate_up_exps;
                 const bool on_gpu = std::string(expert_backend_str(rep, layer_dev)) == "gpu";
 
-                layers.push_back({
+                json entry = {
                     { "layer",   il },
                     { "on_gpu",  on_gpu },
                     { "experts", std::move(experts) },
-                });
+                };
+                if (L.dynamic_experts) {
+                    entry["dynamic"]     = true;
+                    entry["experts_gpu"] = L.dynamic_expert_ids;
+                }
+                layers.push_back(std::move(entry));
             }
         }
 
@@ -5519,10 +5544,19 @@ void server_routes::init_routes() {
             server_expert_placement_change ch;
             ch.layer  = c.value("layer", -1);
             ch.device = c.value("device", 0);
+            const json eg = c.value("experts_gpu", json::array());
+            if (eg.is_array()) {
+                for (const auto & e : eg) {
+                    if (e.is_number_integer()) {
+                        ch.experts.push_back(e.get<int32_t>());
+                    }
+                }
+            }
+            // non-empty experts_gpu -> per-expert; else backend selects whole-layer gpu/cpu
             if (c.contains("backend")) {
                 ch.to_gpu = c.at("backend") == "gpu";
             } else {
-                ch.to_gpu = !c.value("experts_gpu", json::array()).empty();
+                ch.to_gpu = !ch.experts.empty();
             }
             if (ch.layer < 0) {
                 res->error(format_error_response("each change requires a valid \"layer\"", ERROR_TYPE_INVALID_REQUEST));
