@@ -5480,6 +5480,9 @@ void server_routes::init_routes() {
     this->get_expert_placement = [this](const server_http_req &) {
         auto res = create_response();
 
+        uint64_t gpu_expert_bytes = 0;
+        uint64_t gpu_weight_bytes = 0;
+
         const llama_model * model = ctx_server.model_tgt;
         json layers = json::array();
         if (model != nullptr) {
@@ -5498,8 +5501,27 @@ void server_routes::init_routes() {
                 add("ffn_down_exps",    L.ffn_down_exps);
                 add("ffn_gate_up_exps", L.ffn_gate_up_exps);
 
-                if (experts.empty()) {
-                    continue; // dense (non-MoE) layer
+                json weights = json::object();
+                auto add_w = [&](const char * key, const ggml_tensor * t) {
+                    if (t != nullptr) {
+                        weights[key] = expert_backend_str(t, layer_dev);
+                    }
+                };
+                add_w("attn_q",      L.wq);
+                add_w("attn_k",      L.wk);
+                add_w("attn_v",      L.wv);
+                add_w("attn_output", L.wo);
+                add_w("attn_qkv",    L.wqkv);
+                add_w("attn_q_norm", L.attn_q_norm);
+                add_w("attn_k_norm", L.attn_k_norm);
+                add_w("attn_norm",   L.attn_norm);
+                add_w("attn_out_norm", L.attn_out_norm);
+                add_w("ffn_norm",    L.ffn_norm);
+                add_w("ffn_norm_exps", L.ffn_norm_exps);
+                add_w("ffn_gate_inp", L.ffn_gate_inp);
+
+                if (experts.empty() && weights.empty()) {
+                    continue; // no recognizable tensors
                 }
 
                 // representative residency: the down projection (always present and unfused)
@@ -5510,18 +5532,70 @@ void server_routes::init_routes() {
                     { "layer",   il },
                     { "on_gpu",  on_gpu },
                     { "experts", std::move(experts) },
+                    { "weights", std::move(weights) },
                 };
                 if (L.dynamic_experts) {
                     entry["dynamic"]     = true;
                     entry["experts_gpu"] = L.dynamic_expert_ids;
                 }
+
+                // report per-tensor sizes for tensors currently on GPU
+                json sizes = json::object();
+                auto add_size = [&](const char * key, const ggml_tensor * t) {
+                    if (t != nullptr && t->buffer != nullptr) {
+                        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+                        bool is_gpu = dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+                        if (layer_dev != nullptr && ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            is_gpu = is_gpu || std::string(expert_backend_str(t, layer_dev)) == "gpu";
+                        }
+                        if (is_gpu) {
+                            sizes[key] = (uint64_t) ggml_nbytes(t);
+                        }
+                    }
+                };
+                add_size("ffn_gate_exps",    L.ffn_gate_exps);
+                add_size("ffn_up_exps",      L.ffn_up_exps);
+                add_size("ffn_down_exps",    L.ffn_down_exps);
+                add_size("ffn_gate_up_exps", L.ffn_gate_up_exps);
+                add_size("attn_q",      L.wq);
+                add_size("attn_k",      L.wk);
+                add_size("attn_v",      L.wv);
+                add_size("attn_output", L.wo);
+                add_size("attn_qkv",    L.wqkv);
+                add_size("attn_norm",   L.attn_norm);
+                add_size("ffn_norm",    L.ffn_norm);
+                add_size("ffn_gate_inp", L.ffn_gate_inp);
+                if (!sizes.empty()) {
+                    entry["gpu_sizes"] = std::move(sizes);
+                }
+
                 layers.push_back(std::move(entry));
+            }
+
+            // aggregate GPU memory totals
+            for (const auto & l : layers) {
+                if (l.contains("gpu_sizes")) {
+                    const auto & sz = l["gpu_sizes"];
+                    if (sz.contains("ffn_gate_exps"))    gpu_expert_bytes += sz["ffn_gate_exps"].get<uint64_t>();
+                    if (sz.contains("ffn_up_exps"))      gpu_expert_bytes += sz["ffn_up_exps"].get<uint64_t>();
+                    if (sz.contains("ffn_down_exps"))    gpu_expert_bytes += sz["ffn_down_exps"].get<uint64_t>();
+                    if (sz.contains("ffn_gate_up_exps")) gpu_expert_bytes += sz["ffn_gate_up_exps"].get<uint64_t>();
+                    for (auto it = sz.begin(); it != sz.end(); ++it) {
+                        const std::string & key = it.key();
+                        if (key.find("ffn_") != 0 || (key != "ffn_gate_exps" && key != "ffn_up_exps" && key != "ffn_down_exps" && key != "ffn_gate_up_exps")) {
+                            gpu_weight_bytes += it.value().get<uint64_t>();
+                        }
+                    }
+                }
             }
         }
 
         res->ok({
-            { "granularity", "layer" },
-            { "layers",      std::move(layers) },
+            { "granularity",       "layer" },
+            { "layers",            std::move(layers) },
+            { "gpu_expert_bytes",  gpu_expert_bytes },
+            { "gpu_weight_bytes",  gpu_weight_bytes },
+            { "gpu_total_bytes",   gpu_expert_bytes + gpu_weight_bytes },
         });
         return res;
     };
