@@ -24,6 +24,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -2134,6 +2135,7 @@ bool llama_model::set_expert_placement(int il, const std::vector<int32_t> & gpu_
         L.ffn_gate_up_exps_gpu = nullptr;
         L.expert_gpu_mask      = nullptr;
         L.expert_cpu_mask      = nullptr;
+        L.dynamic_sentinel     = false;
         L.dynamic_expert_ids.clear();
         pimpl->expert_dyn.erase(il);
         return true;
@@ -2176,11 +2178,34 @@ bool llama_model::set_expert_placement(int il, const std::vector<int32_t> & gpu_
         }
     }
 
-    if (dev_index < 0 || dev_index >= (int) devices.size()) {
-        err = "invalid GPU device index " + std::to_string(dev_index);
-        return false;
+    // resolve the target buffer type and pick the split-execution scheme.
+    // sentinel-skip MUL_MAT_ID is implemented for CUDA + CPU; other backends (Metal) use masking.
+    ggml_backend_buffer_type_t gpu_buft = nullptr;
+    bool sentinel = false;
+    const bool force_cpu = getenv("LLAMA_MOE_SENTINEL_CPU") != nullptr; // testing: copy on CPU + sentinel
+    if (force_cpu) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev == nullptr) {
+            err = "no CPU device available";
+            return false;
+        }
+        gpu_buft = ggml_backend_dev_buffer_type(cpu_dev);
+        sentinel = true;
+    } else {
+        if (dev_index < 0 || dev_index >= (int) devices.size()) {
+            err = "invalid GPU device index " + std::to_string(dev_index);
+            return false;
+        }
+        ggml_backend_dev_t dev = devices[dev_index].dev;
+        gpu_buft = ggml_backend_dev_buffer_type(dev);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * reg_name = reg != nullptr ? ggml_backend_reg_name(reg) : "";
+        sentinel = reg_name != nullptr && strcmp(reg_name, "CUDA") == 0;
     }
-    ggml_backend_buffer_type_t gpu_buft = ggml_backend_dev_buffer_type(devices[dev_index].dev);
+    if (const char * m = getenv("LLAMA_MOE_EXPERT_MODE")) {
+        if      (strcmp(m, "sentinel") == 0) sentinel = true;
+        else if (strcmp(m, "masking")  == 0) sentinel = false;
+    }
 
     // (re)create the per-layer context holding the full-size GPU copies + masks
     pimpl->expert_dyn.erase(il);
@@ -2233,9 +2258,10 @@ bool llama_model::set_expert_placement(int il, const std::vector<int32_t> & gpu_
     ggml_backend_tensor_set(mask_gpu, host_gpu.data(), 0, host_gpu.size() * sizeof(float));
     ggml_backend_tensor_set(mask_cpu, host_cpu.data(), 0, host_cpu.size() * sizeof(float));
 
-    L.expert_gpu_mask = mask_gpu;
-    L.expert_cpu_mask = mask_cpu;
-    L.dynamic_experts = true;
+    L.expert_gpu_mask  = mask_gpu;
+    L.expert_cpu_mask  = mask_cpu;
+    L.dynamic_experts  = true;
+    L.dynamic_sentinel = sentinel;
     L.dynamic_expert_ids.assign(gpu_expert_ids.begin(), gpu_expert_ids.end());
 
     pimpl->expert_dyn[il] = std::move(holder);

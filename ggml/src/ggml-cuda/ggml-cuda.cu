@@ -2643,8 +2643,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // dynamic per-expert placement (see docs/dynamic-gpu-load-v2.md): when set, expert ids outside
+    // [0, ne02) are a "skip" sentinel whose output rows must be zero. The specialized fused kernels
+    // below index experts by id and assert in-range, so route sentinel-bearing ops to the generic
+    // sort/gather path (below) which handles skipping explicitly.
+    const bool allow_sentinel = dst->op_params[0] != 0;
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if (!allow_sentinel && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
@@ -2703,10 +2709,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
+    // -1 marks a routed slot whose expert is skipped (sentinel); its output row is set to zero.
+    std::fill(ids_from_sorted_host.begin(), ids_from_sorted_host.end(), -1);
+
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                if (allow_sentinel && (expert_to_use < 0 || expert_to_use >= ne02)) {
+                    continue; // skipped expert: leave ids_from_sorted_host[...] == -1
+                }
                 assert(expert_to_use >= 0 && expert_to_use < ne02);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
@@ -2717,8 +2729,24 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
 
+    // valid (non-skipped) rows occupy sorted positions [0, n_sorted); point every skipped slot at a
+    // spare zeroed row so the final scatter writes zeros for it.
+    const int64_t n_sorted  = (int64_t) ids_to_sorted_host.size();
+    const int64_t zero_slot = n_sorted; // first unused sorted row (exists iff any slot was skipped)
+    if (allow_sentinel) {
+        for (auto & v : ids_from_sorted_host) {
+            if (v < 0) {
+                v = (int32_t) zero_slot;
+            }
+        }
+    } else {
+        GGML_ASSERT(n_sorted == ne_get_rows);
+    }
+
+    // ids_from_sorted must land at device offset ne_get_rows, so pad the sorted-src indices to that
+    // length (padding rows are never read for output).
+    ids_to_sorted_host.resize(ne_get_rows, 0);
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
     CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
@@ -2780,6 +2808,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
+    }
+
+    // zero the spare row that skipped slots gather from (matmuls only wrote rows [0, n_sorted))
+    if (allow_sentinel && zero_slot < ne_get_rows) {
+        CUDA_CHECK(cudaMemsetAsync((char *) dst_sorted.ptr + zero_slot*ne0*ts_dst_sorted, 0,
+                                   ne0*ts_dst_sorted, stream));
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,

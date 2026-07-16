@@ -332,8 +332,34 @@ plus a re-reserve.
 - `GET /v1/model/expert-placement` — reports, per layer, whether dynamic mode is active and the
   set of GPU-placed expert ids (in addition to the coarse per-projection residency).
 
+### Sentinel-skip path (CUDA + CPU) - removes the doubling
+
+The masking path above doubles decode expert matmul. The sentinel path removes it by having each
+branch run *only its own* experts; the other side's routed ids are set to a `-1` skip sentinel that
+`MUL_MAT_ID` turns into a zero output row. Selection between the two schemes is per layer
+(`llama_layer::dynamic_sentinel`), decided at placement time by the target device's backend:
+CUDA -> sentinel, Metal -> masking (override with `LLAMA_MOE_EXPERT_MODE=sentinel|masking`).
+
+- **Graph** (`build_moe_ffn`): the same full-size GPU copies are reused; instead of masking the
+  weighted sum, per-branch ids are built from the placement masks -
+  `ids_side = cast_i32( selected*mask_side - mask_other )` (resident -> the real id, else `-1`) -
+  and each branch's two/three `MUL_MAT_ID`s are tagged `op_params[0]=1`. The branch outputs are
+  summed (each expert non-zero on exactly one side) and weighted once. No per-token miss path.
+- **CPU kernel** (`ggml-cpu.c`): when `op_params[0]` is set, out-of-range ids are skipped in the
+  row-grouping and `dst` is pre-zeroed so skipped rows read 0. Backward compatible.
+- **CUDA kernel** (`ggml-cuda.cu`): sentinel ops bypass the fused decode kernels (which assert
+  in-range ids) and take the generic sort/gather path, extended to drop skipped ids and scatter a
+  zeroed row for them. This is host-side index bookkeeping around the unchanged matmul - no device
+  kernel edits. **Status: written, compiles only with CUDA, validated by mirroring the CPU path
+  (which is tested on-device); needs verification on real CUDA hardware.** The generic path uses
+  stream syncs, so measure it against the masking baseline on target hardware.
+
+Validation on Metal: the sentinel graph + CPU kernel are exercised end-to-end with both branches on
+CPU (`LLAMA_MOE_SENTINEL_CPU=1`), producing output bit-identical to the no-placement baseline.
+
 ### Explicitly deferred
 
-Sentinel-skip `MUL_MAT_ID` kernels (removes the compute doubling), compact GPU partition + remap
-(memory-frugal, needed for CUDA), the auto-rebalancer (counters/EWMA/hysteresis, `/policy` +
-`/stats`), per-expert bias/scale (`_exps_b`/`_exps_s`) support, and non-`llama`/`olmoe` arches.
+Compact GPU partition + remap (VRAM-frugal - currently a full-size copy even in sentinel mode),
+sentinel-skip in CUDA's *fused* decode kernels (to avoid the generic path's sync overhead), the
+auto-rebalancer (counters/EWMA/hysteresis, `/policy` + `/stats`), per-expert bias/scale
+(`_exps_b`/`_exps_s`) support, and non-`llama`/`olmoe` arches.

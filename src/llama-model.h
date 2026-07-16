@@ -321,6 +321,7 @@ struct llama_layer {
     struct ggml_tensor * expert_gpu_mask      = nullptr; // 1.0 for GPU-placed experts, else 0.0
     struct ggml_tensor * expert_cpu_mask      = nullptr; // 1.0 - expert_gpu_mask
     bool                 dynamic_experts      = false;
+    bool                 dynamic_sentinel     = false;   // true: sentinel-skip split (CUDA/CPU); false: masking (Metal)
     std::vector<int32_t> dynamic_expert_ids;             // expert ids currently placed on GPU (reporting)
 
     // ff MoE latent proj

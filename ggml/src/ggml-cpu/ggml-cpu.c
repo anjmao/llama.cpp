@@ -1535,6 +1535,11 @@ static void ggml_compute_forward_mul_mat_id(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // dynamic per-expert placement (see docs/dynamic-gpu-load-v2.md): when set, expert ids
+    // outside [0, n_as) are treated as a "skip" sentinel - their output rows are left zero
+    // instead of asserting. Only the MoE split-execution branches set this flag.
+    const bool allow_sentinel = dst->op_params[0] != 0;
+
     const enum ggml_type type = src0->type;
 
     const bool src1_cont = ggml_is_contiguous(src1);
@@ -1611,6 +1616,11 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        // sentinel rows are never scattered to, so pre-zero dst to give them a defined (0) value
+        if (allow_sentinel) {
+            memset(dst->data, 0, ggml_nbytes(dst));
+        }
+
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
@@ -1619,6 +1629,9 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
+                if (allow_sentinel && (i02 < 0 || i02 >= n_as)) {
+                    continue; // skipped expert: leave its dst row zero
+                }
                 assert(i02 >= 0 && i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
