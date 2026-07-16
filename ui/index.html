@@ -129,6 +129,32 @@
         </div>
       </div>
       <div id="chatResponse" x-ref="chatResponse" x-show="showChatResponse" x-text="chatResponse" class="mt-3 max-h-64 overflow-y-auto text-sm whitespace-pre-wrap border border-gray-200 rounded-md p-3 bg-gray-50"></div>
+      <div id="chatTimings" x-show="chatTimings" x-cloak class="mt-3 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 text-sm">
+        <div class="bg-gray-50 border border-gray-200 rounded-md p-2">
+          <div class="text-xs text-gray-500">Output speed</div>
+          <div class="font-mono font-semibold text-blue-700" x-text="chatTimings ? chatTimings.predicted_per_second.toFixed(1) + ' tok/s' : '-'"></div>
+        </div>
+        <div class="bg-gray-50 border border-gray-200 rounded-md p-2">
+          <div class="text-xs text-gray-500">Prompt speed</div>
+          <div class="font-mono font-semibold text-blue-700" x-text="chatTimings ? chatTimings.prompt_per_second.toFixed(1) + ' tok/s' : '-'"></div>
+        </div>
+        <div class="bg-gray-50 border border-gray-200 rounded-md p-2">
+          <div class="text-xs text-gray-500">Generation time</div>
+          <div class="font-mono font-semibold text-gray-800" x-text="chatTimings ? (chatTimings.predicted_ms / 1000).toFixed(2) + ' s' : '-'"></div>
+        </div>
+        <div class="bg-gray-50 border border-gray-200 rounded-md p-2">
+          <div class="text-xs text-gray-500">Prompt time</div>
+          <div class="font-mono font-semibold text-gray-800" x-text="chatTimings ? (chatTimings.prompt_ms / 1000).toFixed(2) + ' s' : '-'"></div>
+        </div>
+        <div class="bg-gray-50 border border-gray-200 rounded-md p-2">
+          <div class="text-xs text-gray-500">Output tokens</div>
+          <div class="font-mono font-semibold text-gray-800" x-text="chatTimings ? chatTimings.predicted_n : '-'"></div>
+        </div>
+        <div class="bg-gray-50 border border-gray-200 rounded-md p-2">
+          <div class="text-xs text-gray-500">Prompt tokens</div>
+          <div class="font-mono font-semibold text-gray-800" x-text="chatTimings ? (chatTimings.prompt_n + (chatTimings.cache_n || 0)) : '-'"></div>
+        </div>
+      </div>
     </div>
 
     <div class="bg-white rounded-lg shadow p-4 mb-4">
@@ -195,7 +221,36 @@
       <div class="bg-white rounded-lg shadow p-4">
         <div class="flex items-center justify-between mb-3">
           <h2 class="text-lg font-semibold">Cumulative</h2>
-          <div class="text-xs text-gray-500">Total selections across whole prompt</div>
+          <div class="flex items-center gap-3 text-xs text-gray-500">
+            <span>Total selections across whole prompt</span>
+            <label class="flex items-center gap-1">
+              <span>Top</span>
+              <input type="number" x-model.number="topExpertsPerLayer" min="1" max="16" class="w-12 px-1 py-0.5 border border-gray-300 rounded text-xs text-center">
+              <span>experts/layer</span>
+            </label>
+            <button
+              id="loadTopExpertsBtn"
+              @click="loadTopExpertsToGpu"
+              :disabled="placingExperts || events.length === 0"
+              class="px-3 py-1 bg-green-100 hover:bg-green-200 text-green-900 rounded text-xs font-medium disabled:opacity-50"
+              x-text="placingExperts ? 'Loading...' : 'Load top experts to GPU'"
+            ></button>
+            <button
+              id="allGpuBtn"
+              @click="placeAllLayers(true)"
+              :disabled="placingExperts || layersArr.length === 0"
+              class="px-3 py-1 bg-blue-100 hover:bg-blue-200 text-blue-900 rounded text-xs font-medium disabled:opacity-50"
+              x-text="placingExperts ? '' : 'All GPU'"
+            ></button>
+            <button
+              id="allCpuBtn"
+              @click="placeAllLayers(false)"
+              :disabled="placingExperts || layersArr.length === 0"
+              class="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-900 rounded text-xs font-medium disabled:opacity-50"
+              x-text="placingExperts ? '' : 'All CPU'"
+            ></button>
+            <span x-show="placementStatus" x-text="placementStatus" class="text-xs text-gray-600"></span>
+          </div>
         </div>
         <div id="cumulativeGrid" class="overflow-x-auto">
           <template x-if="maxLayer < 0 || maxExpert < 0">
@@ -218,7 +273,7 @@
                       class="expert-cell"
                       :class="cumulativeCellClass(layer, ex)"
                       :style="cumulativeCellStyle(layer, ex)"
-                      :title="cellTitle(layer, ex, cumulativeCellCount(layer, ex))"
+                      :title="cumulativeCellTitle(layer, ex, cumulativeCellCount(layer, ex))"
                       x-text="ex"
                     ></div>
                   </template>
@@ -308,6 +363,7 @@
         chatResponse: '',
         chatStatusText: '',
         showChatResponse: false,
+        chatTimings: null,
         saveSessionName: '',
         saving: false,
         showSaveModal: false,
@@ -320,6 +376,7 @@
         layersArr: [],
         cumulativeCounts: {},
         cumulativeMaxCount: 1,
+        cumulativeLayerTotals: {},
         currentCounts: {},
         currentMaxCount: 1,
         currentSelected: {},
@@ -328,6 +385,9 @@
         placementLoaded: false,
         placementTimer: null,
         placementSummaryHTML: '',
+        topExpertsPerLayer: 2,
+        placingExperts: false,
+        placementStatus: '',
 
         get statusClass() {
           if (this.statusText === 'Receiving events') return 'bg-green-100 text-green-800';
@@ -388,6 +448,83 @@
           if (!p) return false;
           if (p.dynamic) return !!p.gpuExperts[ex];
           return p.on_gpu;
+        },
+
+        async loadTopExpertsToGpu() {
+          if (this.placingExperts || this.events.length === 0) return;
+          this.placingExperts = true;
+          this.placementStatus = 'Computing...';
+
+          const topN = Math.max(1, this.topExpertsPerLayer || 2);
+          const changes = [];
+
+          for (const layer of this.layersArr) {
+            const counts = [];
+            for (const ex of this.expertsArr) {
+              const c = this.cumulativeCounts[`${layer}:${ex}`] || 0;
+              if (c > 0) counts.push({ expert: ex, count: c });
+            }
+            if (counts.length === 0) continue;
+            counts.sort((a, b) => b.count - a.count);
+            const topExperts = counts.slice(0, topN).map(c => c.expert);
+            changes.push({ layer: layer, experts_gpu: topExperts });
+          }
+
+          if (changes.length === 0) {
+            this.placementStatus = 'No expert data to place';
+            this.placingExperts = false;
+            return;
+          }
+
+          try {
+            const resp = await fetch('/v1/model/expert-placement', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ changes })
+            });
+            if (!resp.ok) {
+              const text = await resp.text();
+              throw new Error(`HTTP ${resp.status}: ${text}`);
+            }
+            const placed = changes.reduce((sum, c) => sum + c.experts_gpu.length, 0);
+            this.placementStatus = `Placed ${placed} experts across ${changes.length} layers`;
+            await this.fetchPlacement();
+            setTimeout(() => { this.placementStatus = ''; }, 5000);
+          } catch (err) {
+            this.placementStatus = 'Error: ' + err.message;
+          } finally {
+            this.placingExperts = false;
+          }
+        },
+
+        async placeAllLayers(toGpu) {
+          if (this.placingExperts || this.layersArr.length === 0) return;
+          this.placingExperts = true;
+          this.placementStatus = toGpu ? 'Moving all layers to GPU...' : 'Moving all layers to CPU...';
+
+          const changes = this.layersArr.map(layer => ({
+            layer: layer,
+            backend: toGpu ? 'gpu' : 'cpu'
+          }));
+
+          try {
+            const resp = await fetch('/v1/model/expert-placement', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ changes })
+            });
+            if (!resp.ok) {
+              const text = await resp.text();
+              throw new Error(`HTTP ${resp.status}: ${text}`);
+            }
+            this.placementStatus = `${changes.length} layers -> ${toGpu ? 'GPU' : 'CPU'}`;
+            await this.fetchPlacement();
+            setTimeout(() => { this.placementStatus = ''; }, 5000);
+          } catch (err) {
+            this.placementStatus = 'Error: ' + err.message;
+          } finally {
+            this.placingExperts = false;
+          }
         },
 
         generateSessionId() {
@@ -516,6 +653,11 @@
               this.cumulativeCounts[key] = (this.cumulativeCounts[key] || 0) + 1;
             });
           });
+          this.cumulativeLayerTotals = {};
+          for (const [key, cnt] of Object.entries(this.cumulativeCounts)) {
+            const layer = key.split(':')[0];
+            this.cumulativeLayerTotals[layer] = (this.cumulativeLayerTotals[layer] || 0) + cnt;
+          }
           this.cumulativeMaxCount = Math.max(1, ...Object.values(this.cumulativeCounts));
 
           const currentTokenId = this.tokens[this.currentTokenIndex];
@@ -621,6 +763,13 @@
         cellTitle(layer, ex, count) {
           const place = this.isExpertOnGpu(layer, ex) ? 'GPU' : 'CPU';
           return `layer ${layer}, expert ${ex} [${place}]${count ? ', count: ' + count : ''}`;
+        },
+
+        cumulativeCellTitle(layer, ex, count) {
+          const place = this.isExpertOnGpu(layer, ex) ? 'GPU' : 'CPU';
+          const total = this.cumulativeLayerTotals[layer] || 0;
+          const pct = total > 0 ? (count / total * 100).toFixed(1) : '0.0';
+          return `layer ${layer}, expert ${ex} [${place}]${count ? ', count: ' + count + ' (' + pct + '% of layer)' : ''}`;
         },
 
         expertTotal() {
@@ -805,6 +954,7 @@
             this.chatInput = data.last_question || '';
             this.chatResponse = data.last_answer || '';
             this.showChatResponse = this.chatResponse !== '';
+            this.chatTimings = null;
             this.loadedFromHistory = true;
 
             data.events.forEach(ev => this.handleEvent(ev));
@@ -823,6 +973,7 @@
           this.chatStreaming = true;
           this.chatStatusText = 'Sending...';
           this.chatResponse = '';
+          this.chatTimings = null;
           this.showChatResponse = true;
 
           const body = JSON.stringify({
@@ -875,6 +1026,9 @@
                       if (el) el.scrollTop = el.scrollHeight;
                     });
                   }
+                  if (chunk.timings) {
+                    this.chatTimings = chunk.timings;
+                  }
                 } catch (e) {
                   // ignore malformed chunks
                 }
@@ -898,6 +1052,7 @@
           this.chatInput = '';
           this.chatResponse = '';
           this.showChatResponse = false;
+          this.chatTimings = null;
           this.loadedFromHistory = false;
           this.disconnect();
           this.connect();
