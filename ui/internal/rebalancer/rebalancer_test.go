@@ -229,3 +229,31 @@ func TestComputeTargetFillsToK(t *testing.T) {
 		t.Fatalf("expected 4 experts, got %d: %v", len(target), target)
 	}
 }
+
+func TestDiffExperts(t *testing.T) {
+	prev := []int{1, 2, 3}
+	next := []int{2, 3, 4}
+
+	promoted, demoted := diffExperts(prev, next)
+
+	if len(promoted) != 1 || promoted[0] != 4 {
+		t.Errorf("expected promoted [4], got %v", promoted)
+	}
+	if len(demoted) != 1 || demoted[0] != 1 {
+		t.Errorf("expected demoted [1], got %v", demoted)
+	}
+}
+
+func TestDiffExpertsNoChange(t *testing.T) {
+	prev := []int{1, 2, 3}
+	next := []int{1, 2, 3}
+
+	promoted, demoted := diffExperts(prev, next)
+
+	if len(promoted) != 0 {
+		t.Errorf("expected no promotions, got %v", promoted)
+	}
+	if len(demoted) != 0 {
+		t.Errorf("expected no demotions, got %v", demoted)
+	}
+}

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"database/sql"
 	"embed"
@@ -34,17 +33,13 @@ var (
 	nLayers      = flag.Int("n-layers", 16, "model layer count for predictor")
 	nExperts     = flag.Int("n-experts", 64, "experts per layer for predictor")
 	topK         = flag.Int("top-k", 8, "experts to place on GPU per layer")
-	predInterval = flag.Duration("interval", 10*time.Second, "rebalance interval")
+	predInterval = flag.Duration("interval", 10*time.Second, "minimum time between rebalances")
 	tau          = flag.Duration("tau", 30*time.Second, "EWMA time constant")
 	hysteresis   = flag.Int("hysteresis", 2, "rank margin to prevent thrashing")
 	dryRun       = flag.Bool("dry-run", false, "log prediction decisions without POSTing")
 )
 
-var (
-	predCounter   *rebalancer.Counter
-	predRebal     *rebalancer.Rebalancer
-	predPlacement *rebalancer.Client
-)
+
 
 var db *sql.DB
 
@@ -95,10 +90,8 @@ func main() {
 	defer db.Close()
 
 	if *predict {
-		predCounter = rebalancer.NewCounter(*nLayers, *nExperts, *tau)
-		predRebal = rebalancer.New(*nLayers, *topK, *hysteresis)
-		predPlacement = rebalancer.NewClient(*backendURL)
-		go runPredictor(ctx)
+		pred := rebalancer.NewPredictor(*backendURL, *nLayers, *nExperts, *topK, *hysteresis, *tau, *predInterval, *dryRun)
+		go pred.Run(ctx)
 		log.Printf("predictor enabled: layers=%d experts=%d top-k=%d interval=%s tau=%s hysteresis=%d dry-run=%v",
 			*nLayers, *nExperts, *topK, *predInterval, *tau, *hysteresis, *dryRun)
 	}
@@ -252,126 +245,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if predCounter != nil && r.URL.Path == "/v1/moe/routed-experts" {
-			if bytes.HasPrefix(line, []byte("data: ")) {
-				data := bytes.TrimPrefix(line, []byte("data: "))
-				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
-					var ev routed_expert_event
-					if json.Unmarshal(data, &ev) == nil {
-						predCounter.Update(ev.Layer, ev.Experts)
-					}
-				}
-			}
-		}
 		if _, err := w.Write(append(line, '\n')); err != nil {
 			return
 		}
 		flusher.Flush()
 	}
-}
-
-// runPredictor periodically runs the rebalance loop until ctx is cancelled.
-func runPredictor(ctx context.Context) {
-	ticker := time.NewTicker(*predInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			runRebalance()
-		case <-ctx.Done():
-			log.Printf("predictor shutting down")
-			return
-		}
-	}
-}
-
-// runRebalance fetches the current expert placement, computes target GPU
-// expert sets from EWMA rankings, and POSTs the diff back to the backend.
-func runRebalance() {
-	current, err := predPlacement.Get()
-	if err != nil {
-		log.Printf("GET expert-placement failed: %v", err)
-		return
-	}
-
-	targets := make(map[int][]int)
-	for layer := 0; layer < *nLayers; layer++ {
-		ranked := predCounter.Rank(layer)
-
-		var currentGPU []int
-		for _, l := range current.Layers {
-			if l.Layer == layer && l.Dynamic {
-				currentGPU = l.ExpertsGPU
-				break
-			}
-		}
-
-		target := predRebal.ComputeTarget(layer, ranked, currentGPU)
-		if len(target) > 0 {
-			targets[layer] = target
-		}
-	}
-
-	changes := rebalancer.Diff(*nLayers, current.Layers, targets)
-	if changes == nil {
-		log.Printf("rebalance: no changes needed")
-		return
-	}
-
-	// Build a lookup of current GPU experts per layer for diff logging
-	currentMap := make(map[int][]int)
-	for _, l := range current.Layers {
-		if l.Dynamic {
-			currentMap[l.Layer] = l.ExpertsGPU
-		}
-	}
-
-	for _, c := range changes {
-		prev := currentMap[c.Layer]
-		promoted, demoted := diffExperts(prev, c.ExpertsGPU)
-		log.Printf("rebalance layer %d: +%v -%v", c.Layer, promoted, demoted)
-	}
-
-	if *dryRun {
-		return
-	}
-
-	resp, err := predPlacement.Post(changes)
-	if err != nil {
-		log.Printf("POST expert-placement failed: %v", err)
-		return
-	}
-
-	for _, c := range resp.Changes {
-		if !c.OK {
-			log.Printf("rebalance layer %d: FAILED", c.Layer)
-		}
-	}
-}
-
-// diffExperts returns (promoted, demoted) experts between the previous and new GPU sets.
-func diffExperts(prev, next []int) ([]int, []int) {
-	prevSet := make(map[int]bool, len(prev))
-	for _, e := range prev {
-		prevSet[e] = true
-	}
-	nextSet := make(map[int]bool, len(next))
-	for _, e := range next {
-		nextSet[e] = true
-	}
-
-	var promoted, demoted []int
-	for _, e := range next {
-		if !prevSet[e] {
-			promoted = append(promoted, e)
-		}
-	}
-	for _, e := range prev {
-		if !nextSet[e] {
-			demoted = append(demoted, e)
-		}
-	}
-	return promoted, demoted
 }
 
 // handleAPIProxy forwards a request to the backend and passes the response through
