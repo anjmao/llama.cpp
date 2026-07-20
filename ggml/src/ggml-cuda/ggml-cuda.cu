@@ -2479,6 +2479,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
 
+    // Sentinel MUL_MAT_ID not supported in MMVF (mul_mat_vec_f kernel not patched)
+    if (tensor->op == GGML_OP_MUL_MAT_ID && tensor->op_params[0] != 0) {
+        return false;
+    }
+
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
                        ggml_backend_buft_is_cuda_split(src1->buffer->buft);
 
@@ -2523,11 +2528,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
     if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
-        return false;
-    }
-
-    // Sentinel MUL_MAT_ID not yet supported in the fusion path
-    if (tensor->op == GGML_OP_MUL_MAT_ID && tensor->op_params[0] != 0) {
         return false;
     }
 
