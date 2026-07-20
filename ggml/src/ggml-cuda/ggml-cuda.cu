@@ -2526,6 +2526,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
+    // Sentinel MUL_MAT_ID not yet supported in the fusion path
+    if (tensor->op == GGML_OP_MUL_MAT_ID && tensor->op_params[0] != 0) {
+        return false;
+    }
 
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
                        ggml_backend_buft_is_cuda_split(src1->buffer->buft);
@@ -2650,7 +2654,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const bool allow_sentinel = dst->op_params[0] != 0;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (!allow_sentinel && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    // The MMVQ path (mul_mat_vec_q / mul_mat_vec_q_moe) handles sentinel IDs in-kernel,
+    // so it is allowed through when allow_sentinel is set. MMQ and MMF are not yet patched,
+    // so they remain gated and fall through to the generic sort/gather path when sentinel is active.
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
@@ -2660,21 +2667,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
+                if (!allow_sentinel && GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
-            return;
-        }
+        if (!allow_sentinel) {
+            if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+                ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+                return;
+            }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
-            return;
+            if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+                ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+                return;
+            }
         }
     }
 
