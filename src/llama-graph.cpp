@@ -1664,7 +1664,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //     wrong side at the weighted sum. correct, but doubles expert matmul.
     //   - sentinel (CUDA/CPU): each branch runs only its own experts; the other side's ids are set
     //     to a -1 skip sentinel that MUL_MAT_ID zeroes. no doubling.
-    const bool dyn_active   = dyn_layer != nullptr && dyn_layer->dynamic_experts && !weight_before_ffn;
+    // LLAMA_MOE_EXPERT_MODE=none fully disables dynamic placement: the graph reverts to the original
+    // single-path MoE FFN regardless of any per-layer placement state (clean upstream baseline).
+    static const bool moe_disabled = [] {
+        const char * m = getenv("LLAMA_MOE_EXPERT_MODE");
+        return m != nullptr && strcmp(m, "none") == 0;
+    }();
+    const bool dyn_active   = !moe_disabled && dyn_layer != nullptr && dyn_layer->dynamic_experts && !weight_before_ffn;
     const bool dyn_sentinel = dyn_active &&  dyn_layer->dynamic_sentinel;
     const bool dyn_masking  = dyn_active && !dyn_layer->dynamic_sentinel;
 

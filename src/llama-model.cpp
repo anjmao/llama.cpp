@@ -1982,6 +1982,12 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
             });
 }
 
+// LLAMA_MOE_EXPERT_MODE=none disables all runtime expert placement (clean upstream baseline).
+static bool moe_placement_disabled() {
+    const char * m = getenv("LLAMA_MOE_EXPERT_MODE");
+    return m != nullptr && strcmp(m, "none") == 0;
+}
+
 static bool buft_is_cpu(ggml_backend_buffer_t buf) {
     if (buf == nullptr) {
         return true;
@@ -2004,6 +2010,10 @@ static void gather_layer_expert_tensors(const llama_layer & l, std::vector<ggml_
 }
 
 bool llama_model::relocate_layer_experts(int il, bool to_gpu, int dev_index, std::string & err) {
+    if (moe_placement_disabled()) {
+        err = "expert placement disabled (LLAMA_MOE_EXPERT_MODE=none)";
+        return false;
+    }
     if (il < 0 || il >= (int) layers.size()) {
         err = "layer " + std::to_string(il) + " out of range";
         return false;
@@ -2120,6 +2130,10 @@ bool llama_model::relocate_layer_experts(int il, bool to_gpu, int dev_index, std
 }
 
 bool llama_model::set_expert_placement(int il, const std::vector<int32_t> & gpu_expert_ids, int dev_index, std::string & err) {
+    if (moe_placement_disabled()) {
+        err = "expert placement disabled (LLAMA_MOE_EXPERT_MODE=none)";
+        return false;
+    }
     if (il < 0 || il >= (int) layers.size()) {
         err = "layer " + std::to_string(il) + " out of range";
         return false;

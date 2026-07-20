@@ -338,7 +338,15 @@ The masking path above doubles decode expert matmul. The sentinel path removes i
 branch run *only its own* experts; the other side's routed ids are set to a `-1` skip sentinel that
 `MUL_MAT_ID` turns into a zero output row. Selection between the two schemes is per layer
 (`llama_layer::dynamic_sentinel`), decided at placement time by the target device's backend:
-CUDA -> sentinel, Metal -> masking (override with `LLAMA_MOE_EXPERT_MODE=sentinel|masking`).
+CUDA -> sentinel, Metal -> masking.
+
+`LLAMA_MOE_EXPERT_MODE` overrides the scheme:
+- `none`     - fully disable dynamic placement; `build_moe_ffn` reverts to the original single-path
+               MoE FFN and all placement API calls are rejected. Use this to get a clean upstream
+               baseline for troubleshooting.
+- `masking`  - force the masking scheme on all backends.
+- `sentinel` - force the sentinel scheme on all backends.
+- unset      - auto (CUDA -> sentinel, Metal -> masking).
 
 - **Graph** (`build_moe_ffn`): the same full-size GPU copies are reused; instead of masking the
   weighted sum, per-branch ids are built from the placement masks -
