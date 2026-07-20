@@ -440,9 +440,6 @@
           this.connect();
           this.scheduleRender();
           this.fetchPlacement();
-          // per-expert placement can change out-of-band (via POST /v1/model/expert-placement),
-          // so poll it periodically to keep the GPU markers current
-          this.placementTimer = setInterval(() => this.fetchPlacement(), 3000);
         },
 
         async fetchPlacement() {
