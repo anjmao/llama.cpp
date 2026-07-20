@@ -342,11 +342,26 @@ CUDA -> sentinel, Metal -> masking.
 
 `LLAMA_MOE_EXPERT_MODE` overrides the scheme:
 - `none`     - fully disable dynamic placement; `build_moe_ffn` reverts to the original single-path
-               MoE FFN and all placement API calls are rejected. Use this to get a clean upstream
-               baseline for troubleshooting.
+               MoE FFN, all placement API calls are rejected, AND the router-observation callback is
+               not installed (see below). Use this for a clean upstream baseline.
 - `masking`  - force the masking scheme on all backends.
 - `sentinel` - force the sentinel scheme on all backends.
 - unset      - auto (CUDA -> sentinel, Metal -> masking).
+
+### Router-observation callback and CUDA performance
+
+The `/v1/moe/routed-experts` feed is powered by a ggml eval callback that reads each MoE layer's
+top-k ids off the compute graph every decode. On CUDA this is very expensive: the scheduler splits
+the graph at every observed node and issues a device sync per split (`ggml-backend.cpp`), and the
+presence of an eval callback disables CUDA graph capture - together a large decode-throughput drop
+(observed ~10x). It is cheap on Metal, so the cost only shows on CUDA.
+
+The callback is installed by default (to keep the endpoint working). Disable it for baselining or for
+fair placement benchmarks:
+- `LLAMA_MOE_EXPERT_MODE=none`  - disables placement AND the callback (true upstream baseline).
+- `LLAMA_MOE_ROUTER_STATS=0`    - disables only the callback; placement still works. Use this when
+                                  benchmarking `masking` vs `sentinel` on CUDA so the callback's
+                                  per-layer syncs don't dominate the measurement.
 
 - **Graph** (`build_moe_ffn`): the same full-size GPU copies are reused; instead of masking the
   weighted sum, per-branch ids are built from the placement masks -
