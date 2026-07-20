@@ -186,35 +186,14 @@
             <span class="flex items-center gap-1"><span class="gpu-dot"></span> on GPU</span>
           </div>
         </div>
-        <div id="currentGrid" class="overflow-x-auto">
-          <template x-if="maxLayer < 0 || maxExpert < 0">
-            <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
-          </template>
-          <template x-if="maxLayer >= 0 && maxExpert >= 0">
-            <div class="expert-grid" :style="{ gridTemplateColumns: '48px repeat(' + expertsArr.length + ', minmax(18px, 1fr))' }">
-              <div class="layer-label">Layer</div>
-              <template x-for="ex in expertsArr" :key="'h-' + ex">
-                <div class="expert-header" x-text="ex"></div>
-              </template>
-              <template x-for="layer in layersArr" :key="'r-' + layer">
-                <div class="contents">
-                  <div class="layer-label">
-                    <span x-text="'L' + layer"></span>
-                    <span class="backend-badge" :class="backendBadgeClass(layer)" x-text="backendBadgeText(layer)"></span>
-                  </div>
-                  <template x-for="ex in expertsArr" :key="'c-' + layer + '-' + ex">
-                    <div
-                      class="expert-cell"
-                      :class="currentCellClass(layer, ex)"
-                      :style="currentCellStyle(layer, ex)"
-                      :title="cellTitle(layer, ex, currentCellCount(layer, ex))"
-                      x-text="ex"
-                    ></div>
-                  </template>
-                </div>
-              </template>
-            </div>
-          </template>
+        <div id="currentGrid" class="overflow-auto">
+          <div x-show="maxLayer < 0 || maxExpert < 0" class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+          <div x-show="maxLayer >= 0 && maxExpert >= 0" class="relative inline-block">
+            <canvas x-ref="currentCanvas"
+                    @mousemove="onGridHover($event, 'current')"
+                    @mouseleave="onGridLeave('current')"></canvas>
+            <canvas x-ref="currentOverlay" class="absolute top-0 left-0 pointer-events-none"></canvas>
+          </div>
         </div>
       </div>
 
@@ -252,35 +231,14 @@
             <span x-show="placementStatus" x-text="placementStatus" class="text-xs text-gray-600"></span>
           </div>
         </div>
-        <div id="cumulativeGrid" class="overflow-x-auto">
-          <template x-if="maxLayer < 0 || maxExpert < 0">
-            <div class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
-          </template>
-          <template x-if="maxLayer >= 0 && maxExpert >= 0">
-            <div class="expert-grid" :style="{ gridTemplateColumns: '48px repeat(' + expertsArr.length + ', minmax(18px, 1fr))' }">
-              <div class="layer-label">Layer</div>
-              <template x-for="ex in expertsArr" :key="'h-' + ex">
-                <div class="expert-header" x-text="ex"></div>
-              </template>
-              <template x-for="layer in layersArr" :key="'r-' + layer">
-                <div class="contents">
-                  <div class="layer-label">
-                    <span x-text="'L' + layer"></span>
-                    <span class="backend-badge" :class="backendBadgeClass(layer)" x-text="backendBadgeText(layer)"></span>
-                  </div>
-                  <template x-for="ex in expertsArr" :key="'c-' + layer + '-' + ex">
-                    <div
-                      class="expert-cell"
-                      :class="cumulativeCellClass(layer, ex)"
-                      :style="cumulativeCellStyle(layer, ex)"
-                      :title="cumulativeCellTitle(layer, ex, cumulativeCellCount(layer, ex))"
-                      x-text="ex"
-                    ></div>
-                  </template>
-                </div>
-              </template>
-            </div>
-          </template>
+        <div id="cumulativeGrid" class="overflow-auto">
+          <div x-show="maxLayer < 0 || maxExpert < 0" class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
+          <div x-show="maxLayer >= 0 && maxExpert >= 0" class="relative inline-block">
+            <canvas x-ref="cumulativeCanvas"
+                    @mousemove="onGridHover($event, 'cumulative')"
+                    @mouseleave="onGridLeave('cumulative')"></canvas>
+            <canvas x-ref="cumulativeOverlay" class="absolute top-0 left-0 pointer-events-none"></canvas>
+          </div>
         </div>
       </div>
     </div>
@@ -376,6 +334,9 @@
     </div>
   </div>
 
+  <div id="gridTip" class="bg-gray-900 text-white text-xs rounded px-2 py-1 shadow"
+       style="position:fixed;pointer-events:none;z-index:60;display:none;"></div>
+
   <script>
     function moeApp() {
       return {
@@ -429,6 +390,11 @@
         gpuWeightBytes: 0,
         gpuTotalBytes: 0,
         hoveredLayer: -1,
+
+        // canvas heatmap layout (px)
+        CELL: 16,
+        LABEL_W: 56,
+        HEADER_H: 18,
 
         get statusClass() {
           if (this.statusText === 'Receiving events') return 'bg-green-100 text-green-800';
@@ -659,8 +625,16 @@
           }
 
           this.maxLayer = Math.max(this.maxLayer, data.layer);
-          data.experts.forEach(e => {
-            this.maxExpert = Math.max(this.maxExpert, e);
+
+          // maintain cumulative counts incrementally so token-slider moves and
+          // play ticks never have to rescan the whole event log
+          data.experts.forEach(ex => {
+            this.maxExpert = Math.max(this.maxExpert, ex);
+            const key = `${data.layer}:${ex}`;
+            const v = (this.cumulativeCounts[key] || 0) + 1;
+            this.cumulativeCounts[key] = v;
+            if (v > this.cumulativeMaxCount) this.cumulativeMaxCount = v;
+            this.cumulativeLayerTotals[data.layer] = (this.cumulativeLayerTotals[data.layer] || 0) + 1;
           });
 
           if (data.backend) {
@@ -688,24 +662,17 @@
         },
 
         updateComputed() {
-          this.expertsArr = [];
-          for (let i = 0; i <= this.maxExpert; i++) this.expertsArr.push(i);
-          this.layersArr = [];
-          for (let i = 0; i <= this.maxLayer; i++) this.layersArr.push(i);
-
-          this.cumulativeCounts = {};
-          this.events.forEach(e => {
-            e.experts.forEach(ex => {
-              const key = `${e.layer}:${ex}`;
-              this.cumulativeCounts[key] = (this.cumulativeCounts[key] || 0) + 1;
-            });
-          });
-          this.cumulativeLayerTotals = {};
-          for (const [key, cnt] of Object.entries(this.cumulativeCounts)) {
-            const layer = key.split(':')[0];
-            this.cumulativeLayerTotals[layer] = (this.cumulativeLayerTotals[layer] || 0) + cnt;
+          if (this.expertsArr.length !== this.maxExpert + 1) {
+            this.expertsArr = [];
+            for (let i = 0; i <= this.maxExpert; i++) this.expertsArr.push(i);
           }
-          this.cumulativeMaxCount = Math.max(1, ...Object.values(this.cumulativeCounts));
+          if (this.layersArr.length !== this.maxLayer + 1) {
+            this.layersArr = [];
+            for (let i = 0; i <= this.maxLayer; i++) this.layersArr.push(i);
+          }
+
+          // cumulativeCounts / cumulativeLayerTotals / cumulativeMaxCount are
+          // maintained incrementally in handleEvent(); nothing to recompute here.
 
           const currentTokenId = this.tokens[this.currentTokenIndex];
           const currentPosition = this.tokenPosition[currentTokenId];
@@ -730,6 +697,8 @@
           this.currentMaxCount = Math.max(1, ...Object.values(this.currentCounts));
 
           this.placementSummaryHTML = this.buildPlacementSummaryHTML();
+
+          this.drawGrids();
         },
 
         get sortedPlacementLayers() {
@@ -852,39 +821,143 @@
           return this.currentCounts[`${layer}:${ex}`] || 0;
         },
 
-        cumulativeCellClass(layer, ex) {
-          const classes = [this.cumulativeCellCount(layer, ex) > 0 ? 'selected' : 'bg-gray-100'];
-          if (this.isExpertOnGpu(layer, ex)) classes.push('on-gpu');
-          return classes.join(' ');
-        },
-
-        currentCellClass(layer, ex) {
-          const count = this.currentCellCount(layer, ex);
-          const classes = [];
-          if (count > 0) classes.push('selected');
-          else classes.push('bg-gray-100');
-          if (this.currentSelected[layer] && this.currentSelected[layer][ex]) {
-            classes.push('current');
-          }
-          if (this.isExpertOnGpu(layer, ex)) classes.push('on-gpu');
-          return classes.join(' ');
-        },
-
-        cellStyleForCount(count, maxCount) {
-          if (count === 0) return {};
+        heatColor(count, maxCount) {
           const intensity = Math.min(1, count / maxCount);
-          const hue = 217;
-          const sat = 90;
           const light = 95 - intensity * 45;
-          return { backgroundColor: `hsl(${hue}, ${sat}%, ${light}%)` };
+          return `hsl(217, 90%, ${light}%)`;
         },
 
-        cumulativeCellStyle(layer, ex) {
-          return this.cellStyleForCount(this.cumulativeCellCount(layer, ex), this.cumulativeMaxCount);
+        drawGrids() {
+          this.drawGrid(this.$refs.currentCanvas, this.$refs.currentOverlay, 'current');
+          this.drawGrid(this.$refs.cumulativeCanvas, this.$refs.cumulativeOverlay, 'cumulative');
         },
 
-        currentCellStyle(layer, ex) {
-          return this.cellStyleForCount(this.currentCellCount(layer, ex), this.currentMaxCount);
+        // size a canvas to (w,h) CSS px with device-pixel-ratio backing store;
+        // returns a context pre-scaled so all drawing uses CSS px coordinates
+        prepCanvas(canvas, w, h) {
+          const dpr = window.devicePixelRatio || 1;
+          if (canvas._w !== w || canvas._h !== h || canvas._dpr !== dpr) {
+            canvas.width = Math.round(w * dpr);
+            canvas.height = Math.round(h * dpr);
+            canvas.style.width = w + 'px';
+            canvas.style.height = h + 'px';
+            canvas._w = w; canvas._h = h; canvas._dpr = dpr;
+          }
+          const ctx = canvas.getContext('2d');
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, w, h);
+          return ctx;
+        },
+
+        drawGrid(canvas, overlay, mode) {
+          if (!canvas) return;
+          const nEx = this.expertsArr.length;
+          const nL = this.layersArr.length;
+          const CELL = this.CELL, LW = this.LABEL_W, HH = this.HEADER_H;
+          const w = LW + nEx * CELL;
+          const h = HH + nL * CELL;
+          const ctx = this.prepCanvas(canvas, w, h);
+          if (overlay) this.prepCanvas(overlay, w, h);
+          if (nEx === 0 || nL === 0) return;
+
+          const counts = mode === 'current' ? this.currentCounts : this.cumulativeCounts;
+          const maxCount = mode === 'current' ? this.currentMaxCount : this.cumulativeMaxCount;
+          const step = 10; // label every Nth expert index to avoid clutter
+
+          // expert-index header row
+          ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+          ctx.textBaseline = 'middle';
+          ctx.textAlign = 'center';
+          ctx.fillStyle = '#6b7280';
+          for (let c = 0; c < nEx; c++) {
+            const ex = this.expertsArr[c];
+            if (ex % step === 0) ctx.fillText(ex, LW + c * CELL + CELL / 2, HH / 2);
+          }
+
+          for (let r = 0; r < nL; r++) {
+            const layer = this.layersArr[r];
+            const y = HH + r * CELL;
+            const onGpuLayer = this.backendBadgeClass(layer) === 'backend-gpu';
+
+            // layer label cell, tinted by backend residency
+            ctx.fillStyle = onGpuLayer ? '#dbeafe' : '#fee2e2';
+            ctx.fillRect(0, y, LW, CELL);
+            ctx.fillStyle = onGpuLayer ? '#1e40af' : '#991b1b';
+            ctx.textAlign = 'left';
+            ctx.fillText('L' + layer, 4, y + CELL / 2);
+
+            const selRow = mode === 'current' ? this.currentSelected[layer] : null;
+            for (let c = 0; c < nEx; c++) {
+              const ex = this.expertsArr[c];
+              const x = LW + c * CELL;
+              const cnt = counts[`${layer}:${ex}`] || 0;
+              ctx.fillStyle = cnt > 0 ? this.heatColor(cnt, maxCount) : '#f3f4f6';
+              ctx.fillRect(x + 0.5, y + 0.5, CELL - 1, CELL - 1);
+
+              // green corner dot for GPU-resident experts
+              if (this.isExpertOnGpu(layer, ex)) {
+                ctx.fillStyle = '#059669';
+                ctx.beginPath();
+                ctx.arc(x + CELL - 3.5, y + 3.5, 2, 0, 6.2832);
+                ctx.fill();
+              }
+              // blue outline for experts selected by the current token
+              if (selRow && selRow[ex]) {
+                ctx.strokeStyle = '#1d4ed8';
+                ctx.lineWidth = 1.5;
+                ctx.strokeRect(x + 1, y + 1, CELL - 2, CELL - 2);
+              }
+            }
+          }
+        },
+
+        gridCellAt(evt) {
+          const rect = evt.currentTarget.getBoundingClientRect();
+          const x = evt.clientX - rect.left;
+          const y = evt.clientY - rect.top;
+          if (x < this.LABEL_W || y < this.HEADER_H) return null;
+          const c = Math.floor((x - this.LABEL_W) / this.CELL);
+          const r = Math.floor((y - this.HEADER_H) / this.CELL);
+          if (c < 0 || c >= this.expertsArr.length || r < 0 || r >= this.layersArr.length) return null;
+          return { r, c, layer: this.layersArr[r], ex: this.expertsArr[c] };
+        },
+
+        onGridHover(evt, mode) {
+          const cell = this.gridCellAt(evt);
+          const overlay = mode === 'current' ? this.$refs.currentOverlay : this.$refs.cumulativeOverlay;
+          if (!cell) { this.onGridLeave(mode); return; }
+
+          const { r, c, layer, ex } = cell;
+          const cnt = (mode === 'current' ? this.currentCounts : this.cumulativeCounts)[`${layer}:${ex}`] || 0;
+          const tip = document.getElementById('gridTip');
+          if (tip) {
+            tip.textContent = mode === 'current'
+              ? this.cellTitle(layer, ex, cnt)
+              : this.cumulativeCellTitle(layer, ex, cnt);
+            tip.style.display = 'block';
+            tip.style.left = (evt.clientX + 12) + 'px';
+            tip.style.top = (evt.clientY + 12) + 'px';
+          }
+
+          if (overlay) {
+            const octx = overlay.getContext('2d');
+            octx.setTransform(overlay._dpr, 0, 0, overlay._dpr, 0, 0);
+            octx.clearRect(0, 0, overlay._w, overlay._h);
+            octx.strokeStyle = '#111827';
+            octx.lineWidth = 1.5;
+            octx.strokeRect(this.LABEL_W + c * this.CELL + 0.5, this.HEADER_H + r * this.CELL + 0.5, this.CELL - 1, this.CELL - 1);
+          }
+        },
+
+        onGridLeave(mode) {
+          const tip = document.getElementById('gridTip');
+          if (tip) tip.style.display = 'none';
+          const overlay = mode === 'current' ? this.$refs.currentOverlay : this.$refs.cumulativeOverlay;
+          if (overlay && overlay._w) {
+            const octx = overlay.getContext('2d');
+            octx.setTransform(overlay._dpr, 0, 0, overlay._dpr, 0, 0);
+            octx.clearRect(0, 0, overlay._w, overlay._h);
+          }
         },
 
         cellTitle(layer, ex, count) {
@@ -927,10 +1000,20 @@
           this.events = [];
           this.tokens = [];
           this.tokenSet = {};
+          this.tokenText = {};
+          this.tokenPosition = {};
           this.maxLayer = -1;
           this.maxExpert = -1;
           this.currentTokenIndex = 0;
           this.backendByLayer = {};
+          this.expertsArr = [];
+          this.layersArr = [];
+          this.cumulativeCounts = {};
+          this.cumulativeLayerTotals = {};
+          this.cumulativeMaxCount = 1;
+          this.currentCounts = {};
+          this.currentSelected = {};
+          this.currentMaxCount = 1;
           this.stopPlay();
           this.scheduleRender();
         },
