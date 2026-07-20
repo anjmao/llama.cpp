@@ -22,6 +22,7 @@
 #include <cinttypes>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -1417,10 +1418,21 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        // log MoE router expert selections per token
+        // MoE router observation (feeds /v1/moe/routed-experts). This installs a ggml eval callback
+        // that reads the top-k ids off every MoE layer each decode. On CUDA that is very expensive:
+        // it forces a device sync per layer and disables CUDA graph capture (large decode slowdown).
+        // Disable it for a clean baseline via LLAMA_MOE_EXPERT_MODE=none or LLAMA_MOE_ROUTER_STATS=0.
         {
-            params_base.cb_eval = server_moe_router_cb;
-            params_base.cb_eval_user_data = &moe_router_state;
+            const char * mode  = getenv("LLAMA_MOE_EXPERT_MODE");
+            const char * stats = getenv("LLAMA_MOE_ROUTER_STATS");
+            const bool disabled = (mode  != nullptr && strcmp(mode,  "none") == 0) ||
+                                  (stats != nullptr && strcmp(stats, "0")    == 0);
+            if (disabled) {
+                SRV_INF("%s", "MoE router stats disabled; /v1/moe/routed-experts will be empty\n");
+            } else {
+                params_base.cb_eval = server_moe_router_cb;
+                params_base.cb_eval_user_data = &moe_router_state;
+            }
         }
 
         llama_init = common_init_from_params(params_base);
