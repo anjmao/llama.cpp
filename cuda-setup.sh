@@ -51,11 +51,5 @@ cmake --build build --config Debug -j "$(nproc)"
 
 echo "==> Build complete."
 
-# 7. Launch Server
-SERVER_BIN="./build/bin/llama-server"
-if [ ! -f "$SERVER_BIN" ]; then
-    SERVER_BIN="./build/bin/Release/llama-server"
-fi
-
 echo "==> Starting llama-server..."
-exec "$SERVER_BIN" -hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M --host 0.0.0.0
+./build/bin/llama-server -hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M --host 0.0.0.0
