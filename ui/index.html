@@ -214,6 +214,18 @@
               class="px-3 py-1 bg-green-100 hover:bg-green-200 text-green-900 rounded text-xs font-medium disabled:opacity-50"
               x-text="placingExperts ? 'Loading...' : 'Load top experts to GPU'"
             ></button>
+            <label class="flex items-center gap-1">
+              <span>Offload bottom</span>
+              <input type="number" x-model.number="offloadExpertsPerLayer" min="1" max="16" class="w-12 px-1 py-0.5 border border-gray-300 rounded text-xs text-center">
+              <span>experts/layer</span>
+            </label>
+            <button
+              id="offloadBtn"
+              @click="offloadLeastUsedExperts"
+              :disabled="placingExperts || events.length === 0"
+              class="px-3 py-1 bg-orange-100 hover:bg-orange-200 text-orange-900 rounded text-xs font-medium disabled:opacity-50"
+              x-text="placingExperts ? '' : 'Offload least used to CPU'"
+            ></button>
             <button
               id="allGpuBtn"
               @click="placeAllLayers(true)"
@@ -235,8 +247,10 @@
           <div x-show="maxLayer < 0 || maxExpert < 0" class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
           <div x-show="maxLayer >= 0 && maxExpert >= 0" class="relative inline-block">
             <canvas x-ref="cumulativeCanvas"
+                    class="cursor-pointer"
                     @mousemove="onGridHover($event, 'cumulative')"
-                    @mouseleave="onGridLeave('cumulative')"></canvas>
+                    @mouseleave="onGridLeave('cumulative')"
+                    @click="onGridClick($event, 'cumulative')"></canvas>
             <canvas x-ref="cumulativeOverlay" class="absolute top-0 left-0 pointer-events-none"></canvas>
           </div>
         </div>
@@ -253,7 +267,7 @@
       </div>
       <div class="text-xs text-gray-500 mb-2">Per-expert GPU placement from <code class="bg-gray-100 px-1 rounded">/v1/model/expert-placement</code> (green dots on the grids above mark GPU-resident experts)</div>
       <div id="placementSummary" x-html="placementSummaryHTML" class="mb-4"></div>
-      <div x-show="gpuTotalBytes > 0" class="mb-4 flex flex-wrap items-center gap-4 text-sm">
+      <div x-show="gpuTotalBytes > 0 || modelSize > 0" class="mb-4 flex flex-wrap items-center gap-4 text-sm">
         <span class="font-semibold">GPU memory:</span>
         <span class="font-mono text-blue-700" x-text="formatBytes(gpuExpertBytes)"></span>
         <span class="text-gray-400">experts</span>
@@ -262,6 +276,10 @@
         <span class="text-gray-300">|</span>
         <span class="font-semibold">Total:</span>
         <span class="font-mono text-green-700" x-text="formatBytes(gpuTotalBytes)"></span>
+        <span class="text-gray-300">|</span>
+        <span class="font-semibold">Model:</span>
+        <span class="font-mono text-purple-700" x-text="formatBytes(modelSize)"></span>
+        <span class="text-gray-400" x-text="modelNParams > 0 ? '(' + formatParams(modelNParams) + ' params)' : ''"></span>
       </div>
 
       <h3 class="text-sm font-semibold text-gray-700 mb-1">Per-layer tensor residency</h3>
@@ -383,12 +401,15 @@
         placementTimer: null,
         placementSummaryHTML: '',
         topExpertsPerLayer: 2,
+        offloadExpertsPerLayer: 2,
         placingExperts: false,
         placementStatus: '',
         placingLayer: -1,
         gpuExpertBytes: 0,
         gpuWeightBytes: 0,
         gpuTotalBytes: 0,
+        modelSize: 0,
+        modelNParams: 0,
         hoveredLayer: -1,
 
         // canvas heatmap layout (px)
@@ -446,6 +467,8 @@
             this.gpuExpertBytes = data.gpu_expert_bytes || 0;
             this.gpuWeightBytes = data.gpu_weight_bytes || 0;
             this.gpuTotalBytes = data.gpu_total_bytes || 0;
+            this.modelSize = data.model_size || 0;
+            this.modelNParams = data.model_n_params || 0;
             this.placementByLayer = byLayer;
             this.placementLoaded = true;
             this.scheduleRender();
@@ -501,6 +524,69 @@
             }
             const placed = changes.reduce((sum, c) => sum + c.experts_gpu.length, 0);
             this.placementStatus = `Placed ${placed} experts across ${changes.length} layers`;
+            await this.fetchPlacement();
+            setTimeout(() => { this.placementStatus = ''; }, 5000);
+          } catch (err) {
+            this.placementStatus = 'Error: ' + err.message;
+          } finally {
+            this.placingExperts = false;
+          }
+        },
+
+        async offloadLeastUsedExperts() {
+          if (this.placingExperts || this.events.length === 0) return;
+          this.placingExperts = true;
+          this.placementStatus = 'Computing...';
+
+          const offloadN = Math.max(1, this.offloadExpertsPerLayer || 2);
+          const changes = [];
+
+          for (const layer of this.layersArr) {
+            const p = this.placementByLayer[layer];
+            if (!p || !p.gpuExperts) continue;
+
+            // get experts currently on GPU for this layer
+            const onGpu = Object.keys(p.gpuExperts).map(Number);
+            if (onGpu.length === 0) continue;
+
+            // sort by cumulative usage ascending (least used first)
+            onGpu.sort((a, b) => {
+              const ca = this.cumulativeCounts[`${layer}:${a}`] || 0;
+              const cb = this.cumulativeCounts[`${layer}:${b}`] || 0;
+              return ca - cb;
+            });
+
+            // keep all except the bottom N
+            const keep = onGpu.slice(offloadN);
+            if (keep.length === 0) {
+              // all would be offloaded -> set to CPU
+              changes.push({ layer: layer, backend: 'cpu' });
+            } else {
+              changes.push({ layer: layer, experts_gpu: keep });
+            }
+          }
+
+          if (changes.length === 0) {
+            this.placementStatus = 'No GPU experts to offload';
+            this.placingExperts = false;
+            return;
+          }
+
+          try {
+            const resp = await fetch('/v1/model/expert-placement', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ changes })
+            });
+            if (!resp.ok) {
+              const text = await resp.text();
+              throw new Error(`HTTP ${resp.status}: ${text}`);
+            }
+            const offloaded = changes.reduce((sum, c) => {
+              if (c.backend) return sum + (Object.keys(this.placementByLayer[c.layer]?.gpuExperts || {}).length);
+              return sum + (Object.keys(this.placementByLayer[c.layer]?.gpuExperts || {}).length - (c.experts_gpu?.length || 0));
+            }, 0);
+            this.placementStatus = `Offloaded ${offloaded} experts across ${changes.length} layers`;
             await this.fetchPlacement();
             setTimeout(() => { this.placementStatus = ''; }, 5000);
           } catch (err) {
@@ -782,6 +868,61 @@
           }
         },
 
+        async toggleExpertPlacement(layer, expert) {
+          if (this.placingExperts) return;
+          this.placingExperts = true;
+          this.placementStatus = 'Toggling expert...';
+
+          const p = this.placementByLayer[layer];
+          const allExperts = this.expertsArr.slice();
+
+          // determine current state: dynamic mode has explicit gpuExperts set;
+          // whole-layer gpu mode has on_gpu=true with empty gpuExperts (all on GPU)
+          let currentlyOnGpu;
+          let newGpuSet;
+          if (p && p.dynamic) {
+            currentlyOnGpu = p.gpuExperts && p.gpuExperts[expert];
+            newGpuSet = Object.keys(p.gpuExperts || {}).map(Number);
+          } else if (p && p.on_gpu) {
+            // whole-layer GPU mode: all experts are on GPU
+            currentlyOnGpu = true;
+            newGpuSet = allExperts.slice();
+          } else {
+            // whole-layer CPU mode: no experts on GPU
+            currentlyOnGpu = false;
+            newGpuSet = [];
+          }
+
+          if (currentlyOnGpu) {
+            newGpuSet = newGpuSet.filter(e => e !== expert);
+          } else {
+            newGpuSet.push(expert);
+          }
+
+          const change = newGpuSet.length > 0
+            ? { layer: layer, experts_gpu: newGpuSet }
+            : { layer: layer, backend: 'cpu' };
+
+          try {
+            const resp = await fetch('/v1/model/expert-placement', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ changes: [change] })
+            });
+            if (!resp.ok) {
+              const text = await resp.text();
+              throw new Error(`HTTP ${resp.status}: ${text}`);
+            }
+            this.placementStatus = `L${layer} E${expert} -> ${currentlyOnGpu ? 'CPU' : 'GPU'}`;
+            await this.fetchPlacement();
+            setTimeout(() => { this.placementStatus = ''; }, 3000);
+          } catch (err) {
+            this.placementStatus = 'Error: ' + err.message;
+          } finally {
+            this.placingExperts = false;
+          }
+        },
+
         buildPlacementSummaryHTML() {
           const layers = Object.keys(this.placementByLayer).map(Number).sort((a, b) => a - b);
           if (layers.length === 0) {
@@ -960,6 +1101,13 @@
           }
         },
 
+        onGridClick(evt, mode) {
+          if (mode !== 'cumulative') return;
+          const cell = this.gridCellAt(evt);
+          if (!cell) return;
+          this.toggleExpertPlacement(cell.layer, cell.ex);
+        },
+
         cellTitle(layer, ex, count) {
           const place = this.isExpertOnGpu(layer, ex) ? 'GPU' : 'CPU';
           return `layer ${layer}, expert ${ex} [${place}]${count ? ', count: ' + count : ''}`;
@@ -1118,6 +1266,14 @@
           const units = ['B', 'KB', 'MB', 'GB'];
           const i = Math.floor(Math.log(bytes) / Math.log(1024));
           return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+        },
+
+        formatParams(n) {
+          if (!n || n === 0) return '0';
+          if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+          if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+          if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+          return String(n);
         },
 
         async loadSavedSession(id) {

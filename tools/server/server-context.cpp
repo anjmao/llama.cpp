@@ -5565,6 +5565,21 @@ void server_routes::init_routes() {
                 add_size("attn_norm",   L.attn_norm);
                 add_size("ffn_norm",    L.ffn_norm);
                 add_size("ffn_gate_inp", L.ffn_gate_inp);
+
+                // in dynamic mode, the GPU copies are separate full-size tensors
+                if (L.dynamic_experts) {
+                    auto add_dyn = [&](const char * key, const ggml_tensor * t) {
+                        if (t != nullptr && t->buffer != nullptr) {
+                            sizes[key] = (uint64_t) ggml_nbytes(t);
+                        }
+                    };
+                    add_dyn("dyn_ffn_gate_exps_gpu",    L.ffn_gate_exps_gpu);
+                    add_dyn("dyn_ffn_up_exps_gpu",      L.ffn_up_exps_gpu);
+                    add_dyn("dyn_ffn_down_exps_gpu",    L.ffn_down_exps_gpu);
+                    add_dyn("dyn_ffn_gate_up_exps_gpu", L.ffn_gate_up_exps_gpu);
+                    add_dyn("dyn_expert_gpu_mask",     L.expert_gpu_mask);
+                    add_dyn("dyn_expert_cpu_mask",     L.expert_cpu_mask);
+                }
                 if (!sizes.empty()) {
                     entry["gpu_sizes"] = std::move(sizes);
                 }
@@ -5580,10 +5595,18 @@ void server_routes::init_routes() {
                     if (sz.contains("ffn_up_exps"))      gpu_expert_bytes += sz["ffn_up_exps"].get<uint64_t>();
                     if (sz.contains("ffn_down_exps"))    gpu_expert_bytes += sz["ffn_down_exps"].get<uint64_t>();
                     if (sz.contains("ffn_gate_up_exps")) gpu_expert_bytes += sz["ffn_gate_up_exps"].get<uint64_t>();
+                    if (sz.contains("dyn_ffn_gate_exps_gpu"))    gpu_expert_bytes += sz["dyn_ffn_gate_exps_gpu"].get<uint64_t>();
+                    if (sz.contains("dyn_ffn_up_exps_gpu"))      gpu_expert_bytes += sz["dyn_ffn_up_exps_gpu"].get<uint64_t>();
+                    if (sz.contains("dyn_ffn_down_exps_gpu"))    gpu_expert_bytes += sz["dyn_ffn_down_exps_gpu"].get<uint64_t>();
+                    if (sz.contains("dyn_ffn_gate_up_exps_gpu")) gpu_expert_bytes += sz["dyn_ffn_gate_up_exps_gpu"].get<uint64_t>();
+                    if (sz.contains("dyn_expert_gpu_mask"))      gpu_expert_bytes += sz["dyn_expert_gpu_mask"].get<uint64_t>();
+                    if (sz.contains("dyn_expert_cpu_mask"))      gpu_expert_bytes += sz["dyn_expert_cpu_mask"].get<uint64_t>();
                     for (auto it = sz.begin(); it != sz.end(); ++it) {
                         const std::string & key = it.key();
                         if (key.find("ffn_") != 0 || (key != "ffn_gate_exps" && key != "ffn_up_exps" && key != "ffn_down_exps" && key != "ffn_gate_up_exps")) {
-                            gpu_weight_bytes += it.value().get<uint64_t>();
+                            if (key.find("dyn_") != 0) {
+                                gpu_weight_bytes += it.value().get<uint64_t>();
+                            }
                         }
                     }
                 }
@@ -5596,6 +5619,8 @@ void server_routes::init_routes() {
             { "gpu_expert_bytes",  gpu_expert_bytes },
             { "gpu_weight_bytes",  gpu_weight_bytes },
             { "gpu_total_bytes",   gpu_expert_bytes + gpu_weight_bytes },
+            { "model_size",        llama_model_size(model) },
+            { "model_n_params",    llama_model_n_params(model) },
         });
         return res;
     };
