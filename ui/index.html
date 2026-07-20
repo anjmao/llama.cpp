@@ -229,14 +229,14 @@
             <button
               id="allGpuBtn"
               @click="placeAllLayers(true)"
-              :disabled="placingExperts || layersArr.length === 0"
+              :disabled="placingExperts || (layersArr.length === 0 && sortedPlacementLayers.length === 0)"
               class="px-3 py-1 bg-blue-100 hover:bg-blue-200 text-blue-900 rounded text-xs font-medium disabled:opacity-50"
               x-text="placingExperts ? '' : 'All GPU'"
             ></button>
             <button
               id="allCpuBtn"
               @click="placeAllLayers(false)"
-              :disabled="placingExperts || layersArr.length === 0"
+              :disabled="placingExperts || (layersArr.length === 0 && sortedPlacementLayers.length === 0)"
               class="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-900 rounded text-xs font-medium disabled:opacity-50"
               x-text="placingExperts ? '' : 'All CPU'"
             ></button>
@@ -262,10 +262,25 @@
         <h2 class="text-lg font-semibold">Expert placement</h2>
         <div class="flex items-center gap-3">
           <span class="text-xs text-gray-500 flex items-center gap-1"><span class="gpu-dot"></span> = expert resident on GPU</span>
+          <button
+            @click="placeAllLayers(true)"
+            :disabled="placingExperts || sortedPlacementLayers.length === 0"
+            class="px-3 py-1 bg-blue-100 hover:bg-blue-200 text-blue-900 rounded text-xs font-medium disabled:opacity-50"
+            title="Move all layers (experts + dense weights) to GPU"
+            x-text="placingExperts ? '' : 'All GPU'"
+          ></button>
+          <button
+            @click="placeAllLayers(false)"
+            :disabled="placingExperts || sortedPlacementLayers.length === 0"
+            class="px-3 py-1 bg-red-100 hover:bg-red-200 text-red-900 rounded text-xs font-medium disabled:opacity-50"
+            title="Move all layers (experts + dense weights) to CPU"
+            x-text="placingExperts ? '' : 'All CPU'"
+          ></button>
           <button @click="fetchPlacement" class="px-3 py-1 bg-gray-100 hover:bg-gray-200 rounded text-xs font-medium">Refresh</button>
         </div>
       </div>
       <div class="text-xs text-gray-500 mb-2">Per-expert GPU placement from <code class="bg-gray-100 px-1 rounded">/v1/model/expert-placement</code> (green dots on the grids above mark GPU-resident experts)</div>
+      <div x-show="placementStatus" x-text="placementStatus" class="text-xs text-gray-600 mb-2"></div>
       <div id="placementSummary" x-html="placementSummaryHTML" class="mb-4"></div>
       <div x-show="gpuTotalBytes > 0 || modelSize > 0" class="mb-4 flex flex-wrap items-center gap-4 text-sm">
         <span class="font-semibold">GPU memory:</span>
@@ -594,11 +609,17 @@
         },
 
         async placeAllLayers(toGpu) {
-          if (this.placingExperts || this.layersArr.length === 0) return;
+          // prefer routed-experts layer list; fall back to placement-data layers when the
+          // routed-experts stream is not connected, so the Expert placement card buttons
+          // still work standalone.
+          const layerList = this.layersArr.length > 0
+            ? this.layersArr
+            : this.sortedPlacementLayers;
+          if (this.placingExperts || layerList.length === 0) return;
           this.placingExperts = true;
           this.placementStatus = toGpu ? 'Moving all layers to GPU...' : 'Moving all layers to CPU...';
 
-          const changes = this.layersArr.map(layer => ({
+          const changes = layerList.map(layer => ({
             layer: layer,
             backend: toGpu ? 'gpu' : 'cpu'
           }));

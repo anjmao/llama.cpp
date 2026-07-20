@@ -2009,6 +2009,30 @@ static void gather_layer_expert_tensors(const llama_layer & l, std::vector<ggml_
     }
 }
 
+// dense (non-expert) per-layer weights that should move with the layer when
+// the whole layer is relocated between CPU and GPU via relocate_layer_experts().
+static void gather_layer_dense_tensors(const llama_layer & l, std::vector<ggml_tensor *> & out) {
+    ggml_tensor * candidates[] = {
+        // attention
+        l.wq,        l.wk,        l.wv,        l.wo,        l.wqkv,
+        l.attn_q_norm, l.attn_k_norm, l.attn_norm, l.attn_out_norm,
+        l.attn_norm_b, l.attn_q_norm_b, l.attn_k_norm_b, l.attn_out_norm_b,
+        l.attn_norm_2, l.attn_norm_2_b, l.attn_sub_norm, l.attn_post_norm,
+        // ffn (dense + shared expert)
+        l.ffn_norm,   l.ffn_norm_b,   l.ffn_norm_exps, l.ffn_post_norm,
+        l.ffn_gate,   l.ffn_down,     l.ffn_up,
+        l.ffn_gate_inp, l.ffn_gate_inp_s, l.ffn_gate_inp_b,
+        l.ffn_gate_shexp, l.ffn_down_shexp, l.ffn_up_shexp, l.ffn_gate_inp_shexp,
+        // ffn biases
+        l.ffn_gate_b, l.ffn_down_b, l.ffn_up_b,
+    };
+    for (ggml_tensor * t : candidates) {
+        if (t != nullptr) {
+            out.push_back(t);
+        }
+    }
+}
+
 bool llama_model::relocate_layer_experts(int il, bool to_gpu, int dev_index, std::string & err) {
     if (moe_placement_disabled()) {
         err = "expert placement disabled (LLAMA_MOE_EXPERT_MODE=none)";
@@ -2021,8 +2045,9 @@ bool llama_model::relocate_layer_experts(int il, bool to_gpu, int dev_index, std
 
     std::vector<ggml_tensor *> tensors;
     gather_layer_expert_tensors(layers[il], tensors);
+    gather_layer_dense_tensors(layers[il], tensors);
     if (tensors.empty()) {
-        err = "layer " + std::to_string(il) + " has no MoE expert tensors";
+        err = "layer " + std::to_string(il) + " has no relocatable tensors";
         return false;
     }
 
@@ -2041,14 +2066,14 @@ bool llama_model::relocate_layer_experts(int il, bool to_gpu, int dev_index, std
         if (slot.home_buffer == nullptr && !slot.on_gpu) {
             if (!buft_is_cpu(t->buffer)) {
                 pimpl->expert_reloc.erase(t);
-                err = "layer " + std::to_string(il) + " experts are GPU-resident at load; "
-                      "only CPU-home experts can be relocated";
+                err = "layer " + std::to_string(il) + " tensors are GPU-resident at load; "
+                      "only CPU-home tensors can be relocated";
                 return false;
             }
             const char * name = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
             if (name != nullptr && (strstr(name, "REPACK") != nullptr || strstr(name, "AMX") != nullptr)) {
                 pimpl->expert_reloc.erase(t);
-                err = std::string("layer ") + std::to_string(il) + " experts use a repacked CPU layout (" +
+                err = std::string("layer ") + std::to_string(il) + " tensors use a repacked CPU layout (" +
                       name + "); relocation to GPU is not supported";
                 return false;
             }
