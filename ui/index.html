@@ -180,25 +180,6 @@
     <div class="flex flex-col gap-4">
       <div class="bg-white rounded-lg shadow p-4">
         <div class="flex items-center justify-between mb-3">
-          <h2 class="text-lg font-semibold">Current position</h2>
-          <div class="text-xs text-gray-500 flex items-center gap-3">
-            <span>Experts selected up to current token</span>
-            <span class="flex items-center gap-1"><span class="gpu-dot"></span> on GPU</span>
-          </div>
-        </div>
-        <div id="currentGrid" class="overflow-auto">
-          <div x-show="maxLayer < 0 || maxExpert < 0" class="text-sm text-gray-400 italic p-8 text-center">Waiting for data...</div>
-          <div x-show="maxLayer >= 0 && maxExpert >= 0" class="relative inline-block">
-            <canvas x-ref="currentCanvas"
-                    @mousemove="onGridHover($event, 'current')"
-                    @mouseleave="onGridLeave('current')"></canvas>
-            <canvas x-ref="currentOverlay" class="absolute top-0 left-0 pointer-events-none"></canvas>
-          </div>
-        </div>
-      </div>
-
-      <div class="bg-white rounded-lg shadow p-4">
-        <div class="flex items-center justify-between mb-3">
           <h2 class="text-lg font-semibold">Cumulative</h2>
           <div class="flex items-center gap-3 text-xs text-gray-500">
             <span>Total selections across whole prompt</span>
@@ -407,9 +388,6 @@
         cumulativeCounts: {},
         cumulativeMaxCount: 1,
         cumulativeLayerTotals: {},
-        currentCounts: {},
-        currentMaxCount: 1,
-        currentSelected: {},
         backendLegendHTML: '',
         placementByLayer: {},
         placementLoaded: false,
@@ -732,28 +710,6 @@
               if (v > this.cumulativeMaxCount) this.cumulativeMaxCount = v;
             });
             this.cumulativeLayerTotals[data.layer] = (this.cumulativeLayerTotals[data.layer] || 0) + layerTotal;
-
-            // store latest snapshot for current-position view
-            this.currentCounts = this.currentCounts || {};
-            this.currentSelected = this.currentSelected || {};
-          } else if (data.experts) {
-            // callback per-token event (LLAMA_MOE_ROUTER_STATS=1)
-            if (!this.tokenSet[data.token_id]) {
-              this.tokenSet[data.token_id] = true;
-              this.tokenPosition[data.token_id] = this.tokens.length;
-              this.tokens.push(data.token_id);
-            }
-            if (data.token) {
-              this.tokenText[data.token_id] = data.token;
-            }
-            data.experts.forEach(ex => {
-              this.maxExpert = Math.max(this.maxExpert, ex);
-              const key = `${data.layer}:${ex}`;
-              const v = (this.cumulativeCounts[key] || 0) + 1;
-              this.cumulativeCounts[key] = v;
-              if (v > this.cumulativeMaxCount) this.cumulativeMaxCount = v;
-              this.cumulativeLayerTotals[data.layer] = (this.cumulativeLayerTotals[data.layer] || 0) + 1;
-            });
           }
 
           if (data.backend) {
@@ -792,40 +748,6 @@
 
           // cumulativeCounts / cumulativeLayerTotals / cumulativeMaxCount are
           // maintained incrementally in handleEvent(); nothing to recompute here.
-
-          if (this.tokens.length > 0) {
-            // per-token callback mode: current-position view tracks a token slider
-            const currentTokenId = this.tokens[this.currentTokenIndex];
-            const currentPosition = this.tokenPosition[currentTokenId];
-            this.currentCounts = {};
-            this.currentSelected = {};
-            if (currentPosition !== undefined) {
-              this.events.forEach(e => {
-                if (this.tokenPosition[e.token_id] <= currentPosition) {
-                  if (e.experts) {
-                    e.experts.forEach(ex => {
-                      const key = `${e.layer}:${ex}`;
-                      this.currentCounts[key] = (this.currentCounts[key] || 0) + 1;
-                    });
-                  }
-                }
-                if (e.token_id === currentTokenId) {
-                  if (!this.currentSelected[e.layer]) this.currentSelected[e.layer] = {};
-                  if (e.experts) {
-                    e.experts.forEach(ex => {
-                      this.currentSelected[e.layer][ex] = true;
-                    });
-                  }
-                }
-              });
-            }
-            this.currentMaxCount = Math.max(1, ...Object.values(this.currentCounts));
-          } else {
-            // device-buffer poll mode: latest poll snapshot is the current-position view
-            this.currentCounts = {};
-            this.currentSelected = {};
-            this.currentMaxCount = 1;
-          }
 
           this.placementSummaryHTML = this.buildPlacementSummaryHTML();
 
@@ -1003,10 +925,6 @@
           return this.cumulativeCounts[`${layer}:${ex}`] || 0;
         },
 
-        currentCellCount(layer, ex) {
-          return this.currentCounts[`${layer}:${ex}`] || 0;
-        },
-
         heatColor(count, maxCount) {
           const intensity = Math.min(1, count / maxCount);
           const light = 95 - intensity * 45;
@@ -1014,7 +932,6 @@
         },
 
         drawGrids() {
-          this.drawGrid(this.$refs.currentCanvas, this.$refs.currentOverlay, 'current');
           this.drawGrid(this.$refs.cumulativeCanvas, this.$refs.cumulativeOverlay, 'cumulative');
         },
 
@@ -1046,8 +963,8 @@
           if (overlay) this.prepCanvas(overlay, w, h);
           if (nEx === 0 || nL === 0) return;
 
-          const counts = mode === 'current' ? this.currentCounts : this.cumulativeCounts;
-          const maxCount = mode === 'current' ? this.currentMaxCount : this.cumulativeMaxCount;
+          const counts = this.cumulativeCounts;
+          const maxCount = this.cumulativeMaxCount;
           const step = 10; // label every Nth expert index to avoid clutter
 
           // expert-index header row
@@ -1072,7 +989,7 @@
             ctx.textAlign = 'left';
             ctx.fillText('L' + layer, 4, y + CELL / 2);
 
-            const selRow = mode === 'current' ? this.currentSelected[layer] : null;
+            const selRow = null;
             for (let c = 0; c < nEx; c++) {
               const ex = this.expertsArr[c];
               const x = LW + c * CELL;
@@ -1110,16 +1027,14 @@
 
         onGridHover(evt, mode) {
           const cell = this.gridCellAt(evt);
-          const overlay = mode === 'current' ? this.$refs.currentOverlay : this.$refs.cumulativeOverlay;
+          const overlay = this.$refs.cumulativeOverlay;
           if (!cell) { this.onGridLeave(mode); return; }
 
           const { r, c, layer, ex } = cell;
-          const cnt = (mode === 'current' ? this.currentCounts : this.cumulativeCounts)[`${layer}:${ex}`] || 0;
+          const cnt = this.cumulativeCounts[`${layer}:${ex}`] || 0;
           const tip = document.getElementById('gridTip');
           if (tip) {
-            tip.textContent = mode === 'current'
-              ? this.cellTitle(layer, ex, cnt)
-              : this.cumulativeCellTitle(layer, ex, cnt);
+            tip.textContent = this.cumulativeCellTitle(layer, ex, cnt);
             tip.style.display = 'block';
             tip.style.left = (evt.clientX + 12) + 'px';
             tip.style.top = (evt.clientY + 12) + 'px';
@@ -1138,7 +1053,7 @@
         onGridLeave(mode) {
           const tip = document.getElementById('gridTip');
           if (tip) tip.style.display = 'none';
-          const overlay = mode === 'current' ? this.$refs.currentOverlay : this.$refs.cumulativeOverlay;
+          const overlay = this.$refs.cumulativeOverlay;
           if (overlay && overlay._w) {
             const octx = overlay.getContext('2d');
             octx.setTransform(overlay._dpr, 0, 0, overlay._dpr, 0, 0);
@@ -1204,9 +1119,6 @@
           this.cumulativeCounts = {};
           this.cumulativeLayerTotals = {};
           this.cumulativeMaxCount = 1;
-          this.currentCounts = {};
-          this.currentSelected = {};
-          this.currentMaxCount = 1;
           this.stopPlay();
           this.scheduleRender();
         },

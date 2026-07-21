@@ -5496,7 +5496,7 @@ void server_routes::init_routes() {
 
         const llama_model * model = ctx_server.model_tgt;
 
-        res->next = [model, &should_stop = req.should_stop](std::string & chunk) -> bool {
+        res->next = [model, should_stop = req.should_stop](std::string & chunk) -> bool {
             chunk.clear();
 
             if (model == nullptr || model->moe_stats_buf == nullptr) {
