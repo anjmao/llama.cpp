@@ -1641,13 +1641,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // In-place add: stats_view += counts_1d
         // ggml_acc_inplace(ctx, a, b, nb1, nb2, nb3, offset); for 1D contiguous, use total size
-        ggml_acc_inplace(ctx0, stats_view, counts_1d,
+        ggml_tensor * acc_result = ggml_acc_inplace(ctx0, stats_view, counts_1d,
                          n_expert * sizeof(float),
                          n_expert * sizeof(float),
                          n_expert * sizeof(float),
                          0);
         cb(moe_stats_buf, "ffn_moe_stats_acc", il);
-        ggml_build_forward_expand(gf, moe_stats_buf);
+        ggml_build_forward_expand(gf, acc_result);
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
