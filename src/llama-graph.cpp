@@ -1043,6 +1043,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
     n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used),
+    moe_stats_buf    (params.moe_stats_buf),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),
@@ -1605,6 +1606,48 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
+
+    // device-resident expert count accumulation (no callback, no D2H sync)
+    // Uses ggml_get_rows_back as a scatter-add (histogram) to count expert selections.
+    // Persistent device buffer at a fixed address, like the KV cache, so it is graph-capturable.
+    if (moe_stats_buf != nullptr) {
+        const int64_t n_sel = n_expert_used * n_tokens;
+
+        // Flatten selected_experts: [n_expert_used, n_tokens] -> [n_expert_used * n_tokens] I32
+        // ggml_get_rows_back requires b to be a 1D vector (asserts ggml_is_vector(b))
+        ggml_tensor * flat_ids = ggml_view_1d(ctx0, selected_experts, n_sel, 0);
+
+        // Ones: [1, n_sel] F32 - gradient values to scatter (all 1.0 for counting)
+        // ggml_get_rows_back requires a to be a matrix (asserts ggml_is_matrix(a))
+        ggml_tensor * ones_template = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_sel);
+        ggml_tensor * ones = ggml_fill(ctx0, ones_template, 1.0f);
+
+        // Shape reference: [1, n_expert] F32 - view into stats_buf, only shape matters
+        // ggml_get_rows_back requires c to be a matrix (asserts ggml_is_matrix(c))
+        // and a->ne[0] == c->ne[0] (both 1 here). Output is [1, n_expert] F32.
+        ggml_tensor * shape_ref = ggml_view_2d(ctx0, moe_stats_buf, 1, (int64_t)n_expert,
+                                                sizeof(float), 0);
+
+        // Scatter-add: counts[e] = sum(1.0 for each i where flat_ids[i] == e)
+        ggml_tensor * counts = ggml_get_rows_back(ctx0, ones, flat_ids, shape_ref);
+        // counts: [1, n_expert] F32
+
+        // Reshape to 1D [n_expert] for acc
+        ggml_tensor * counts_1d = ggml_view_1d(ctx0, counts, n_expert, 0);
+
+        // View into stats_buf[:, il] at byte offset il * n_expert * sizeof(float)
+        ggml_tensor * stats_view = ggml_view_1d(ctx0, moe_stats_buf, n_expert,
+                                                 il * n_expert * sizeof(float));
+
+        // In-place add: stats_view += counts_1d
+        // ggml_acc_inplace(ctx, a, b, nb1, nb2, nb3, offset); for 1D contiguous, use total size
+        ggml_acc_inplace(ctx0, stats_view, counts_1d,
+                         n_expert * sizeof(float),
+                         n_expert * sizeof(float),
+                         n_expert * sizeof(float),
+                         0);
+        cb(moe_stats_buf, "ffn_moe_stats_acc", il);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented

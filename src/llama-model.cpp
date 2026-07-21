@@ -1024,6 +1024,15 @@ struct llama_model::impl {
         ggml_backend_buffer_ptr buf;
     };
     std::unordered_map<int, expert_dyn_ctx> expert_dyn;
+
+    // device-resident MoE expert routing stats buffer (moe_stats_buf). owns the ggml_context
+    // holding the tensor metadata and the backend buffer backing it, so the tensor address is
+    // stable for the lifetime of the model (required for CUDA graph capture).
+    struct moe_stats_ctx {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+    };
+    moe_stats_ctx moe_stats;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1636,6 +1645,40 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // allocate the device-resident MoE expert routing stats buffer ([n_expert, n_layer] F32).
+    // only for MoE models; non-MoE models leave moe_stats_buf null. placed on the device that
+    // owns layer 0's experts (matching how expert tensors are placed across tensor splits),
+    // and zeroed so the first accumulation window starts from a clean slate.
+    // gated on LLAMA_MOE_ROUTER_STATS != "0" so the buffer (and the in-graph accumulation ops
+    // that feed it) can be disabled entirely for a zero-overhead baseline.
+    const bool moe_stats_disabled = [] {
+        const char * stats = getenv("LLAMA_MOE_ROUTER_STATS");
+        return stats != nullptr && strcmp(stats, "0") == 0;
+    }();
+    if (hparams.n_expert > 0 && !moe_stats_disabled) {
+        const int64_t ne_stats[2] = { (int64_t) hparams.n_expert, (int64_t) hparams.n_layer() };
+
+        ggml_init_params ip = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        pimpl->moe_stats.ctx.reset(ggml_init(ip));
+        moe_stats_buf = ggml_new_tensor(pimpl->moe_stats.ctx.get(), GGML_TYPE_F32, 2, ne_stats);
+        ggml_set_name(moe_stats_buf, "moe_stats_buf");
+
+        ggml_backend_dev_t        dev  = dev_layer(0);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+        pimpl->moe_stats.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pimpl->moe_stats.ctx.get(), buft));
+        if (!pimpl->moe_stats.buf) {
+            throw std::runtime_error(format("%s: failed to allocate MoE stats buffer", __func__));
+        }
+
+        const size_t nbytes = ggml_nbytes(moe_stats_buf);
+        std::vector<float> zeros(nbytes / sizeof(float), 0.0f);
+        ggml_backend_tensor_set(moe_stats_buf, zeros.data(), 0, nbytes);
     }
 
     return true;

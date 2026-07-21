@@ -1418,20 +1418,24 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        // MoE router observation (feeds /v1/moe/routed-experts). This installs a ggml eval callback
-        // that reads the top-k ids off every MoE layer each decode. On CUDA that is very expensive:
-        // it forces a device sync per layer and disables CUDA graph capture (large decode slowdown).
-        // Disable it for a clean baseline via LLAMA_MOE_EXPERT_MODE=none or LLAMA_MOE_ROUTER_STATS=0.
+        // MoE router observation. Aggregated per-expert counts are now accumulated in-graph into a
+        // device-resident buffer (model->moe_stats_buf, allocated at model load) and read on demand
+        // by /v1/moe/routed-experts/completion. No eval callback is registered by default, so CUDA
+        // graph capture stays on.
+        //
+        // The per-token streaming endpoint (/v1/moe/routed-experts) still relies on an eval callback
+        // for debug/visualization. Opt in explicitly with LLAMA_MOE_ROUTER_STATS=1; any other value
+        // (unset or "0") leaves the callback off. The stats buffer itself is gated on the same
+        // env var being != "0" (see llama_model::load_tensors).
         {
-            const char * mode  = getenv("LLAMA_MOE_EXPERT_MODE");
             const char * stats = getenv("LLAMA_MOE_ROUTER_STATS");
-            const bool disabled = (mode  != nullptr && strcmp(mode,  "none") == 0) ||
-                                  (stats != nullptr && strcmp(stats, "0")    == 0);
-            if (disabled) {
-                SRV_INF("%s", "MoE router stats disabled; /v1/moe/routed-experts will be empty\n");
-            } else {
+            const bool stream_cb = stats != nullptr && strcmp(stats, "1") == 0;
+            if (stream_cb) {
+                SRV_INF("%s", "MoE router per-token streaming callback enabled (LLAMA_MOE_ROUTER_STATS=1); CUDA graph capture will be off\n");
                 params_base.cb_eval = server_moe_router_cb;
                 params_base.cb_eval_user_data = &moe_router_state;
+            } else {
+                SRV_INF("%s", "MoE router stats read from device buffer; per-token callback off (CUDA graph capture stays on)\n");
             }
         }
 
@@ -5424,14 +5428,60 @@ void server_routes::init_routes() {
             return res;
         }
 
-        json agg = ctx_server.moe_router_state.get_cmpl_aggregation(cmpl_id);
-        if (agg.is_null()) {
+        // Read aggregated per-expert counts directly from the device-resident stats buffer
+        // (model->moe_stats_buf), then zero it so the next read starts a fresh accumulation
+        // window. One D2H sync per fetch instead of one sync per layer per token.
+        const llama_model * model = ctx_server.model_tgt;
+        if (model == nullptr || model->moe_stats_buf == nullptr) {
             res->status = 404;
-            res->data = safe_json_to_str({{"error", format_error_response("No routed expert data found for completion_id", ERROR_TYPE_NOT_FOUND)}});
+            res->data = safe_json_to_str({{"error", format_error_response("MoE stats disabled", ERROR_TYPE_NOT_FOUND)}});
             return res;
         }
 
-        res->data = safe_json_to_str(agg);
+        const int64_t n_expert = model->hparams.n_expert;
+        const int64_t n_layer  = model->hparams.n_layer();
+        const size_t  nbytes   = (size_t) n_expert * (size_t) n_layer * sizeof(float);
+
+        std::vector<float> counts(n_expert * n_layer);
+        ggml_backend_tensor_get(model->moe_stats_buf, counts.data(), 0, nbytes);
+
+        // Zero the device buffer for the next accumulation window. This host-initiated write
+        // runs outside the captured graph, between replays - safe because the graph always
+        // does stats += counts; resetting just starts a fresh window.
+        std::vector<float> zeros(n_expert * n_layer, 0.0f);
+        ggml_backend_tensor_set(model->moe_stats_buf, zeros.data(), 0, nbytes);
+
+        json layers = json::array();
+        for (int il = 0; il < n_layer; il++) {
+            ggml_backend_dev_t layer_dev = model->dev_layer(il);
+            const auto & L = model->layers[il];
+
+            json backend;
+            backend["ffn_down_exps"]    = expert_backend_str(L.ffn_down_exps,    layer_dev);
+            backend["ffn_gate_up_exps"] = expert_backend_str(L.ffn_gate_up_exps, layer_dev);
+            backend["ffn_up_exps"]      = expert_backend_str(L.ffn_up_exps,      layer_dev);
+            backend["ffn_gate_exps"]    = expert_backend_str(L.ffn_gate_exps,    layer_dev);
+
+            std::vector<int> layer_counts(n_expert, 0);
+            int total = 0;
+            for (int e = 0; e < n_expert; e++) {
+                layer_counts[e] = (int) counts[il * n_expert + e];
+                total += layer_counts[e];
+            }
+
+            json layer_json;
+            layer_json["layer"]   = il;
+            layer_json["total"]   = total;
+            layer_json["counts"]  = std::move(layer_counts);
+            layer_json["backend"] = std::move(backend);
+            layers.push_back(std::move(layer_json));
+        }
+
+        json res_json;
+        res_json["completion_id"] = cmpl_id;
+        res_json["n_experts"]     = n_expert;
+        res_json["layers"]        = std::move(layers);
+        res->data = safe_json_to_str(res_json);
         return res;
     };
 

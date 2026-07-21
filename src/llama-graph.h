@@ -626,6 +626,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    struct ggml_tensor * moe_stats_buf = nullptr; // [n_expert, n_layer] F32, or null
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -806,6 +808,8 @@ struct llm_graph_context {
     const int64_t n_embd_v_gqa;
     const int64_t n_expert;
     const int64_t n_expert_used;
+
+    struct ggml_tensor * moe_stats_buf; // device-resident expert count buffer, or null
 
     const float freq_base;
     const float freq_scale;

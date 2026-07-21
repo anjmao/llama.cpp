@@ -2415,6 +2415,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.moe_stats_buf =*/ model.moe_stats_buf,
     };
 }
 

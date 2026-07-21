@@ -556,6 +556,11 @@ struct llama_model {
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
+    // device-resident persistent buffer of accumulated per-expert routing counts,
+    // [n_expert, n_layer] F32. Allocated only for MoE models (n_expert > 0); stays
+    // null otherwise. Owned by pimpl (context + backend buffer).
+    struct ggml_tensor * moe_stats_buf   = nullptr;
+
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
