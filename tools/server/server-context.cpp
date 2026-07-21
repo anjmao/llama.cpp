@@ -29,6 +29,7 @@
 #include <memory>
 #include <filesystem>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <fstream>
 
@@ -5485,54 +5486,75 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // Poll the device-resident moe_stats_buf instead of the callback sample queue.
+    // The buffer aggregates per-expert routing counts across all sessions; the
+    // session_id query param is ignored here (no per-session filter on the buffer).
     this->get_moe_routed_experts = [this](const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         res->content_type = "text/event-stream";
         res->headers["Cache-Control"] = "no-cache";
 
-        const std::string session_id_filter = req.get_param("session_id");
+        const llama_model * model = ctx_server.model_tgt;
 
-        auto & state = ctx_server.moe_router_state;
-
-        res->next = [&state, &should_stop = req.should_stop, session_id_filter](std::string & chunk) -> bool {
+        res->next = [model, &should_stop = req.should_stop](std::string & chunk) -> bool {
             chunk.clear();
 
-            std::vector<server_moe_router_sample> batch;
-            batch.reserve(128);
-
-            server_moe_router_sample sample;
-            while (batch.size() < 128 && state.pop_sample(sample, std::chrono::milliseconds(100))) {
-                if (session_id_filter.empty() || sample.session_id == session_id_filter) {
-                    batch.push_back(std::move(sample));
-                }
-            }
-
-            if (batch.empty()) {
+            if (model == nullptr || model->moe_stats_buf == nullptr) {
                 if (should_stop()) {
                     return false;
                 }
                 return true;
             }
 
-            for (const auto & s : batch) {
-                json j;
-                j["completion_id"] = s.cmpl_id;
-                j["layer"] = s.layer;
-                j["token_id"] = s.token_id;
-                j["token"] = s.token;
-                j["session_id"] = s.session_id;
-                j["experts"] = s.experts;
+            const int64_t n_expert = model->hparams.n_expert;
+            const int64_t n_layer  = model->hparams.n_layer();
+            const size_t  nbytes   = (size_t) n_expert * (size_t) n_layer * sizeof(float);
+
+            std::vector<float> counts(n_expert * n_layer);
+            ggml_backend_tensor_get(model->moe_stats_buf, counts.data(), 0, nbytes);
+
+            // zero the buffer for the next polling window
+            std::vector<float> zeros(n_expert * n_layer, 0.0f);
+            ggml_backend_tensor_set(model->moe_stats_buf, zeros.data(), 0, nbytes);
+
+            // emit one event per layer with the aggregated counts
+            for (int il = 0; il < n_layer; il++) {
+                ggml_backend_dev_t layer_dev = model->dev_layer(il);
+                const auto & L = model->layers[il];
 
                 json backend;
-                backend["ffn_down_exps"]    = s.down_exps_host    ? "cpu" : "gpu";
-                backend["ffn_gate_up_exps"] = s.gate_up_exps_host ? "cpu" : "gpu";
-                backend["ffn_up_exps"]      = s.up_exps_host      ? "cpu" : "gpu";
-                backend["ffn_gate_exps"]    = s.gate_exps_host    ? "cpu" : "gpu";
-                j["backend"] = backend;
+                backend["ffn_down_exps"]    = expert_backend_str(L.ffn_down_exps,    layer_dev);
+                backend["ffn_gate_up_exps"] = expert_backend_str(L.ffn_gate_up_exps, layer_dev);
+                backend["ffn_up_exps"]      = expert_backend_str(L.ffn_up_exps,      layer_dev);
+                backend["ffn_gate_exps"]    = expert_backend_str(L.ffn_gate_exps,    layer_dev);
+
+                std::vector<int> expert_ids;
+                std::vector<int> expert_counts;
+                int total = 0;
+                for (int e = 0; e < n_expert; e++) {
+                    expert_ids.push_back(e);
+                    int c = (int) counts[il * n_expert + e];
+                    expert_counts.push_back(c);
+                    total += c;
+                }
+
+                json j;
+                j["layer"]   = il;
+                j["experts"]  = expert_ids;
+                j["counts"]   = expert_counts;
+                j["backend"]  = backend;
+                j["n_experts"] = n_expert;
+                j["total"]    = total;
 
                 chunk += "data: " + j.dump() + "\n\n";
             }
 
+            // sleep 500ms before next poll to avoid busy-looping
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+            if (should_stop()) {
+                return false;
+            }
             return true;
         };
 

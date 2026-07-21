@@ -719,27 +719,42 @@
         handleEvent(data) {
           this.events.push(data);
 
-          if (!this.tokenSet[data.token_id]) {
-            this.tokenSet[data.token_id] = true;
-            this.tokenPosition[data.token_id] = this.tokens.length;
-            this.tokens.push(data.token_id);
-          }
-          if (data.token) {
-            this.tokenText[data.token_id] = data.token;
-          }
-
           this.maxLayer = Math.max(this.maxLayer, data.layer);
+          this.maxExpert = Math.max(this.maxExpert, (data.n_experts || 0) - 1);
 
-          // maintain cumulative counts incrementally so token-slider moves and
-          // play ticks never have to rescan the whole event log
-          data.experts.forEach(ex => {
-            this.maxExpert = Math.max(this.maxExpert, ex);
-            const key = `${data.layer}:${ex}`;
-            const v = (this.cumulativeCounts[key] || 0) + 1;
-            this.cumulativeCounts[key] = v;
-            if (v > this.cumulativeMaxCount) this.cumulativeMaxCount = v;
-            this.cumulativeLayerTotals[data.layer] = (this.cumulativeLayerTotals[data.layer] || 0) + 1;
-          });
+          if (data.counts) {
+            // device-buffer poll: data.counts is per-expert aggregated counts for this layer
+            const layerTotal = data.total || 0;
+            data.counts.forEach((c, ex) => {
+              const key = `${data.layer}:${ex}`;
+              const v = (this.cumulativeCounts[key] || 0) + c;
+              this.cumulativeCounts[key] = v;
+              if (v > this.cumulativeMaxCount) this.cumulativeMaxCount = v;
+            });
+            this.cumulativeLayerTotals[data.layer] = (this.cumulativeLayerTotals[data.layer] || 0) + layerTotal;
+
+            // store latest snapshot for current-position view
+            this.currentCounts = this.currentCounts || {};
+            this.currentSelected = this.currentSelected || {};
+          } else if (data.experts) {
+            // callback per-token event (LLAMA_MOE_ROUTER_STATS=1)
+            if (!this.tokenSet[data.token_id]) {
+              this.tokenSet[data.token_id] = true;
+              this.tokenPosition[data.token_id] = this.tokens.length;
+              this.tokens.push(data.token_id);
+            }
+            if (data.token) {
+              this.tokenText[data.token_id] = data.token;
+            }
+            data.experts.forEach(ex => {
+              this.maxExpert = Math.max(this.maxExpert, ex);
+              const key = `${data.layer}:${ex}`;
+              const v = (this.cumulativeCounts[key] || 0) + 1;
+              this.cumulativeCounts[key] = v;
+              if (v > this.cumulativeMaxCount) this.cumulativeMaxCount = v;
+              this.cumulativeLayerTotals[data.layer] = (this.cumulativeLayerTotals[data.layer] || 0) + 1;
+            });
+          }
 
           if (data.backend) {
             this.backendByLayer[data.layer] = data.backend;
@@ -778,27 +793,39 @@
           // cumulativeCounts / cumulativeLayerTotals / cumulativeMaxCount are
           // maintained incrementally in handleEvent(); nothing to recompute here.
 
-          const currentTokenId = this.tokens[this.currentTokenIndex];
-          const currentPosition = this.tokenPosition[currentTokenId];
-          this.currentCounts = {};
-          this.currentSelected = {};
-          if (currentPosition !== undefined) {
-            this.events.forEach(e => {
-              if (this.tokenPosition[e.token_id] <= currentPosition) {
-                e.experts.forEach(ex => {
-                  const key = `${e.layer}:${ex}`;
-                  this.currentCounts[key] = (this.currentCounts[key] || 0) + 1;
-                });
-              }
-              if (e.token_id === currentTokenId) {
-                if (!this.currentSelected[e.layer]) this.currentSelected[e.layer] = {};
-                e.experts.forEach(ex => {
-                  this.currentSelected[e.layer][ex] = true;
-                });
-              }
-            });
+          if (this.tokens.length > 0) {
+            // per-token callback mode: current-position view tracks a token slider
+            const currentTokenId = this.tokens[this.currentTokenIndex];
+            const currentPosition = this.tokenPosition[currentTokenId];
+            this.currentCounts = {};
+            this.currentSelected = {};
+            if (currentPosition !== undefined) {
+              this.events.forEach(e => {
+                if (this.tokenPosition[e.token_id] <= currentPosition) {
+                  if (e.experts) {
+                    e.experts.forEach(ex => {
+                      const key = `${e.layer}:${ex}`;
+                      this.currentCounts[key] = (this.currentCounts[key] || 0) + 1;
+                    });
+                  }
+                }
+                if (e.token_id === currentTokenId) {
+                  if (!this.currentSelected[e.layer]) this.currentSelected[e.layer] = {};
+                  if (e.experts) {
+                    e.experts.forEach(ex => {
+                      this.currentSelected[e.layer][ex] = true;
+                    });
+                  }
+                }
+              });
+            }
+            this.currentMaxCount = Math.max(1, ...Object.values(this.currentCounts));
+          } else {
+            // device-buffer poll mode: latest poll snapshot is the current-position view
+            this.currentCounts = {};
+            this.currentSelected = {};
+            this.currentMaxCount = 1;
           }
-          this.currentMaxCount = Math.max(1, ...Object.values(this.currentCounts));
 
           this.placementSummaryHTML = this.buildPlacementSummaryHTML();
 
