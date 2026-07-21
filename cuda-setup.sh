@@ -43,7 +43,7 @@ cmake -B build \
     -DCMAKE_BUILD_TYPE=Debug \
     -DGGML_CUDA=ON \
     -DLLAMA_OPENSSL=ON \
-    -DCMAKE_CUDA_ARCHITECTURES=89-real
+    -DCMAKE_CUDA_ARCHITECTURES=native
 
 # 6. Build llama.cpp
 echo "==> Building llama.cpp..."
