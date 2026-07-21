@@ -701,15 +701,14 @@
           this.maxExpert = Math.max(this.maxExpert, (data.n_experts || 0) - 1);
 
           if (data.counts) {
-            // device-buffer poll: data.counts is per-expert aggregated counts for this layer
-            const layerTotal = data.total || 0;
+            // device-buffer poll: replace cumulative with latest buffer snapshot
+            this.cumulativeMaxCount = 1;
+            this.cumulativeLayerTotals[data.layer] = data.total || 0;
             data.counts.forEach((c, ex) => {
               const key = `${data.layer}:${ex}`;
-              const v = (this.cumulativeCounts[key] || 0) + c;
-              this.cumulativeCounts[key] = v;
-              if (v > this.cumulativeMaxCount) this.cumulativeMaxCount = v;
+              this.cumulativeCounts[key] = c;
+              if (c > this.cumulativeMaxCount) this.cumulativeMaxCount = c;
             });
-            this.cumulativeLayerTotals[data.layer] = (this.cumulativeLayerTotals[data.layer] || 0) + layerTotal;
           }
 
           if (data.backend) {

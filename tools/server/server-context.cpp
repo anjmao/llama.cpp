@@ -5446,12 +5446,6 @@ void server_routes::init_routes() {
         std::vector<float> counts(n_expert * n_layer);
         ggml_backend_tensor_get(model->moe_stats_buf, counts.data(), 0, nbytes);
 
-        // Zero the device buffer for the next accumulation window. This host-initiated write
-        // runs outside the captured graph, between replays - safe because the graph always
-        // does stats += counts; resetting just starts a fresh window.
-        std::vector<float> zeros(n_expert * n_layer, 0.0f);
-        ggml_backend_tensor_set(model->moe_stats_buf, zeros.data(), 0, nbytes);
-
         json layers = json::array();
         for (int il = 0; il < n_layer; il++) {
             ggml_backend_dev_t layer_dev = model->dev_layer(il);
@@ -5512,10 +5506,6 @@ void server_routes::init_routes() {
 
             std::vector<float> counts(n_expert * n_layer);
             ggml_backend_tensor_get(model->moe_stats_buf, counts.data(), 0, nbytes);
-
-            // zero the buffer for the next polling window
-            std::vector<float> zeros(n_expert * n_layer, 0.0f);
-            ggml_backend_tensor_set(model->moe_stats_buf, zeros.data(), 0, nbytes);
 
             // emit one event per layer with the aggregated counts
             for (int il = 0; il < n_layer; il++) {
