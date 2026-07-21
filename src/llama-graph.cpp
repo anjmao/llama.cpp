@@ -1647,6 +1647,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                          n_expert * sizeof(float),
                          0);
         cb(moe_stats_buf, "ffn_moe_stats_acc", il);
+        ggml_build_forward_expand(gf, moe_stats_buf);
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
