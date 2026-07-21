@@ -2650,7 +2650,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const bool allow_sentinel = dst->op_params[0] != 0;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (!allow_sentinel && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
