@@ -513,7 +513,7 @@ static __global__ void mul_mat_vec_q(
     sample_dst = blockIdx.z;
 
     if (ids && channel_x >= nchannels_x) {
-        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
+        if (threadIdx.x < rows_per_cuda_block && (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
             dst[channel_dst*stride_channel_dst + threadIdx.y*stride_col_dst + row0 + threadIdx.x] = 0.0f;
         }
         return;
